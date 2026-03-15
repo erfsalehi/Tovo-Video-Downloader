@@ -1,11 +1,11 @@
 # Tovo Video Downloader 🚀
 
-A modern, Apple-inspired GUI application for batch downloading videos from various social media platforms using `yt-dlp`. It features automatic subtitle synchronization with Whisper AI and a streamlined workflow for video editors and content creators.
+A modern, streamlined GUI application for batch downloading videos from various social media platforms using `yt-dlp`. It features automatic subtitle synchronization with Whisper AI and a streamlined workflow for video editors and content creators.
 
 ## ✨ Features
 
 - **Batch Downloading**: Paste multiple titles and links to download them all at once.
-- **Apple-Style GUI**: A clean, modern interface built with Python's Tkinter.
+- **Modern GUI**: A clean, premium interface built with Python's Tkinter.
 - **Whisper AI Integration**: Automatically sync subtitles with video or dub audio using Whisper's smart alignment.
 - **Premiere Pro Ready**: Downloads videos in high-quality H.264/AAC MP4 format for maximum compatibility.
 - **Automatic Setup**: Automatically downloads required binaries (`yt-dlp` and `FFmpeg`) on first run.
