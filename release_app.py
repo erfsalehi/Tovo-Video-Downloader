@@ -3,6 +3,11 @@ import zipfile
 import shutil
 
 def create_release():
+    """
+    Bundles the application into a portable ZIP file.
+    Includes core scripts, requirements, and empty configuration/data folders.
+    Excludes large binaries and local user data to keep the release lightweight.
+    """
     project_dir = os.path.dirname(os.path.abspath(__file__))
     release_name = "Video_Downloader_Portable.zip"
     release_path = os.path.join(project_dir, release_name)

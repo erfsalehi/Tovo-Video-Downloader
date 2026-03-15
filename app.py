@@ -10,6 +10,10 @@ import zipfile
 import ssl
 
 class RoundedButton(tk.Canvas):
+    """
+    A custom Tkinter widget that renders a modern, rounded button using a Canvas.
+    Supports hover effects and custom styling to match Apple-style aesthetics.
+    """
     def __init__(self, parent, text, command=None, radius=20, bg_color="#0066CC", hover_color="#0055B3", text_color="white", font=("Segoe UI", 12, "bold"), **kwargs):
         super().__init__(parent, bg=parent["bg"], highlightthickness=0, **kwargs)
         self.text = text
@@ -82,6 +86,10 @@ class RoundedButton(tk.Canvas):
 
 
 class AppleStyleApp:
+    """
+    Main Application class for the Video Downloader.
+    Handles the GUI construction, user interaction, and orchestrates the download process.
+    """
     def __init__(self, root):
         self.root = root
         self.root.title("Video Downloader")
@@ -250,7 +258,10 @@ class AppleStyleApp:
         self.root.after(500, self.check_dependencies)
 
     def check_dependencies(self):
-        """Checks if yt-dlp and ffmpeg are available."""
+        """
+        Verifies that yt-dlp and FFmpeg are present on the system.
+        If missing, it offers the user to download them automatically.
+        """
         missing = []
         
         # Check for yt-dlp
@@ -274,7 +285,10 @@ class AppleStyleApp:
                 self.log("[!] Warning: Missing dependencies. App may not function correctly.")
 
     def download_tools(self):
-        """Downloads missing binaries."""
+        """
+        Automates the download and extraction of yt-dlp.exe and ffmpeg.exe.
+        Uses urllib for downloading and zipfile for extraction.
+        """
         self.log("--- Starting Dependency Setup ---")
         base_path = os.path.dirname(os.path.abspath(__file__))
         
@@ -380,6 +394,11 @@ class AppleStyleApp:
         self.root.update_idletasks()
 
     def start_download(self):
+        """
+        Triggered by the 'Start Download' button. 
+        Parses the input text area for Title/Link pairs and optional captions,
+        validates the input, and kicks off the background download thread.
+        """
         if self.downloading:
             return
 
@@ -477,6 +496,11 @@ class AppleStyleApp:
         threading.Thread(target=self.download_process, args=(titles, links, subtitles_list, sync_mode), daemon=True).start()
 
     def download_process(self, titles, links, subtitles_list, sync_mode):
+        """
+        The core download logic running in a separate thread.
+        Iterates through the batch list, calls yt-dlp via subprocess,
+        and handles subtitle generation (standard or Whisper AI).
+        """
         def format_time(seconds):
             hours = seconds // 3600
             minutes = (seconds % 3600) // 60
