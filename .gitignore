@@ -1,0 +1,31 @@
+# Compiled Python files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local configuration
+config.json
+cookies.txt
+
+# Large binaries
+yt-dlp.exe
+ffmpeg.exe
+ffmpeg.zip
+*.zip
+
+# Virtual environments
+venv/
+.venv/
+
+# Downloaded content
+Downloads/
+Titles.txt
+batch_links.txt
+
+# Log files
+errors.txt
+
+# IDE files
+.vscode/
+.idea/

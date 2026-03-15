@@ -1,0 +1,5 @@
+yt-dlp
+stable-whisper
+openai-whisper
+torch
+# Note: ffmpeg is also required but must be installed separately on the system.
