@@ -207,7 +207,6 @@ class AppleStyleApp:
         
         tk.Label(self.dub_frame, text="(Optional) Dub Folder:", bg=self.bg_color, fg=self.text_color, font=(self.font_family, 11, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 10))
         
-        self.dub_dir = self.dub_dir  # Already set by _load_config
         dub_label_text = self.dub_dir if self.dub_dir else "Not Selected (Uses Video Audio)"
         self.dub_dir_label = tk.Label(self.dub_frame, text=dub_label_text, bg=self.bg_color, fg="#555555", font=(self.font_family, 10))
         self.dub_dir_label.grid(row=0, column=1, sticky="w")
@@ -218,6 +217,26 @@ class AppleStyleApp:
             font=(self.font_family, 10, "bold"), width=100, height=35
         )
         self.dub_browse_btn.grid(row=0, column=2, sticky="e")
+
+        
+        # Row 6: Advanced Options (Cookies)
+        self.advanced_frame = tk.Frame(self.main_frame, bg=self.bg_color)
+        self.advanced_frame.grid(row=6, column=0, sticky="ew", pady=(0, 15))
+        
+        self.use_browser_cookies = tk.BooleanVar(value=self.config.get("use_browser_cookies", False))
+        self.cookies_check = tk.Checkbutton(
+            self.advanced_frame, text="Use Chrome Cookies (as fallback)", 
+            variable=self.use_browser_cookies, bg=self.bg_color, activebackground=self.bg_color,
+            fg=self.text_color, font=(self.font_family, 10), command=self._save_config
+        )
+        self.cookies_check.pack(side=tk.LEFT)
+        
+        # Option to clear cookies file if it's causing issues
+        self.clear_cookies_btn = tk.Button(
+            self.advanced_frame, text="Clear local cookies.txt", font=(self.font_family, 9),
+            command=self.clear_local_cookies, bg=self.gray_bg, relief=tk.FLAT
+        )
+        self.clear_cookies_btn.pack(side=tk.RIGHT)
 
 
         self.button_frame = tk.Frame(self.main_frame, bg=self.bg_color)
@@ -274,10 +293,15 @@ class AppleStyleApp:
         if not (shutil.which("ffmpeg") or os.path.exists(ffmpeg_local)):
             missing.append("FFmpeg")
             
+        # Check for Deno (JS Runtime for yt-dlp)
+        deno_local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deno.exe")
+        if not (shutil.which("deno") or os.path.exists(deno_local)):
+            missing.append("Deno (JS Runtime)")
+            
         if missing:
             msg = f"The following essential tools are missing:\n\n" + "\n".join([f"• {m}" for m in missing])
-            msg += "\n\nWithout these, downloads and high-quality processing will fail."
-            msg += "\n\nWould you like the app to download them automatically for you? (approx. 100MB)"
+            msg += "\n\nWithout these, downloads and high-quality processing may be restricted."
+            msg += "\n\nWould you like the app to download them automatically for you?"
             
             if messagebox.askyesno("Missing Dependencies", msg):
                 threading.Thread(target=self.download_tools, daemon=True).start()
@@ -286,14 +310,15 @@ class AppleStyleApp:
 
     def download_tools(self):
         """
-        Automates the download and extraction of yt-dlp.exe and ffmpeg.exe.
-        Uses urllib for downloading and zipfile for extraction.
+        Automates the download and extraction of yt-dlp.exe, ffmpeg.exe, and deno.exe.
+        Uses urllib with a User-Agent to prevent blocks and ensuring all handles are closed.
         """
         self.log("--- Starting Dependency Setup ---")
         base_path = os.path.dirname(os.path.abspath(__file__))
         
         # Bypass SSL verification for some environments
         context = ssl._create_unverified_context()
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
         
         try:
             # 1. Download yt-dlp.exe
@@ -301,7 +326,8 @@ class AppleStyleApp:
             if not os.path.exists(yt_dlp_path):
                 self.log("-> Downloading yt-dlp.exe...")
                 url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
-                with urllib.request.urlopen(url, context=context) as response, open(yt_dlp_path, 'wb') as out_file:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, context=context) as response, open(yt_dlp_path, 'wb') as out_file:
                     shutil.copyfileobj(response, out_file)
                 self.log("   Done!")
 
@@ -309,24 +335,65 @@ class AppleStyleApp:
             ffmpeg_path = os.path.join(base_path, "ffmpeg.exe")
             if not os.path.exists(ffmpeg_path):
                 self.log("-> Downloading FFmpeg (This may take a moment)...")
-                # Using a direct zip link from gyan.dev
                 zip_url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
                 temp_zip = os.path.join(base_path, "ffmpeg.zip")
                 
-                with urllib.request.urlopen(zip_url, context=context) as response, open(temp_zip, 'wb') as out_file:
-                    shutil.copyfileobj(response, out_file)
+                try:
+                    req = urllib.request.Request(zip_url, headers=headers)
+                    with urllib.request.urlopen(req, context=context) as response, open(temp_zip, 'wb') as out_file:
+                        shutil.copyfileobj(response, out_file)
+                        
+                    self.log("-> Extracting FFmpeg...")
+                    with zipfile.ZipFile(temp_zip, 'r') as zip_ref:
+                        for member in zip_ref.namelist():
+                            if member.endswith("ffmpeg.exe"):
+                                with zip_ref.open(member) as source:
+                                    with open(ffmpeg_path, 'wb') as target:
+                                        shutil.copyfileobj(source, target)
+                                break
+                except zipfile.BadZipFile:
+                    self.log("-> Error: FFmpeg download was corrupted (Invalid ZIP). Please try again.")
+                    if os.path.exists(ffmpeg_path): os.remove(ffmpeg_path)
+                finally:
+                    if os.path.exists(temp_zip):
+                        try:
+                            os.remove(temp_zip)
+                        except Exception as e:
+                            self.log(f"-> Warning: Could not remove temporary zip: {str(e)}")
+                
+                if os.path.exists(ffmpeg_path):
+                    self.log("   Done!")
+                else:
+                    raise Exception("FFmpeg extraction failed.")
+
+            # 3. Download Deno
+            deno_path = os.path.join(base_path, "deno.exe")
+            if not os.path.exists(deno_path):
+                self.log("-> Downloading Deno (JS Runtime for YouTube extraction)...")
+                deno_url = "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip"
+                temp_deno_zip = os.path.join(base_path, "deno.zip")
+                
+                try:
+                    req = urllib.request.Request(deno_url, headers=headers)
+                    with urllib.request.urlopen(req, context=context) as response, open(temp_deno_zip, 'wb') as out_file:
+                        shutil.copyfileobj(response, out_file)
                     
-                self.log("-> Extracting FFmpeg...")
-                with zipfile.ZipFile(temp_zip, 'r') as zip_ref:
-                    # Find the bin folder inside the zip
-                    for member in zip_ref.namelist():
-                        if member.endswith("ffmpeg.exe"):
-                            source = zip_ref.open(member)
-                            with open(ffmpeg_path, 'wb') as target:
-                                shutil.copyfileobj(source, target)
-                                
-                os.remove(temp_zip)
-                self.log("   Done!")
+                    self.log("-> Extracting Deno...")
+                    with zipfile.ZipFile(temp_deno_zip, 'r') as zip_ref:
+                        zip_ref.extractall(base_path)
+                except zipfile.BadZipFile:
+                    self.log("-> Error: Deno download was corrupted. Please try again.")
+                finally:
+                    if os.path.exists(temp_deno_zip):
+                        try:
+                            os.remove(temp_deno_zip)
+                        except Exception as e:
+                            self.log(f"-> Warning: Could not remove temporary zip: {str(e)}")
+                
+                if os.path.exists(deno_path):
+                    self.log("   Done!")
+                else:
+                    raise Exception("Deno extraction failed.")
                 
             self.log("--- Setup Complete! You are ready to go. ---")
             messagebox.showinfo("Setup Complete", "All dependencies have been downloaded and installed successfully.")
@@ -339,19 +406,33 @@ class AppleStyleApp:
         default_downloads = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Downloads")
         try:
             with open(self.config_path, 'r') as f:
-                cfg = json.load(f)
-            self.downloads_dir = cfg.get("downloads_dir", default_downloads)
-            self.dub_dir = cfg.get("dub_dir", "")
+                self.config = json.load(f)
+            self.downloads_dir = self.config.get("downloads_dir", default_downloads)
+            self.dub_dir = self.config.get("dub_dir", "")
         except Exception:
+            self.config = {}
             self.downloads_dir = default_downloads
             self.dub_dir = ""
+            
+    def clear_local_cookies(self):
+        cookies_txt = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+        if os.path.exists(cookies_txt):
+            if messagebox.askyesno("Clear Cookies", "Are you sure you want to delete the local cookies.txt file? This may help if you're getting authentication errors."):
+                try:
+                    os.remove(cookies_txt)
+                    self.log("-> Removed local cookies.txt")
+                except Exception as e:
+                    self.log(f"-> Error removing cookies: {str(e)}")
+        else:
+            messagebox.showinfo("Clear Cookies", "No local cookies.txt found.")
 
     def _save_config(self):
         try:
             with open(self.config_path, 'w') as f:
                 json.dump({
                     "downloads_dir": self.downloads_dir, 
-                    "dub_dir": self.dub_dir
+                    "dub_dir": self.dub_dir,
+                    "use_browser_cookies": self.use_browser_cookies.get()
                 }, f)
         except Exception:
             pass
@@ -546,6 +627,19 @@ class AppleStyleApp:
                     "--merge-output-format", "mp4",
                 ]
                 
+                # 1. Handle Cookies
+                cookies_txt = os.path.join(base_path, "cookies.txt")
+                if os.path.exists(cookies_txt):
+                    cmd.extend(["--cookies", cookies_txt])
+                elif self.use_browser_cookies.get():
+                    # Fallback to browser cookies if enabled and no local file
+                    cmd.extend(["--cookies-from-browser", "chrome"])
+
+                # 2. Handle JS Runtime (Deno)
+                deno_exe = os.path.join(base_path, "deno.exe")
+                if os.path.exists(deno_exe):
+                    cmd.extend(["--js-runtime", "deno:" + deno_exe])
+
                 # If local ffmpeg exists, tell yt-dlp to use it
                 ffmpeg_exe = os.path.join(base_path, "ffmpeg.exe")
                 if os.path.exists(ffmpeg_exe):

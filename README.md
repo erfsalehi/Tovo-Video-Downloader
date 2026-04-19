@@ -19,16 +19,8 @@ A modern, streamlined GUI application for batch downloading videos from various 
    cd Tovo-Video-Downloader
    ```
 
-2. **Install Dependencies**:
-   Ensure you have Python 3.8+ installed, then run:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. **Run the App**:
-   ```bash
-   python app.py
-   ```
+2. **Run the App**:
+   Simply double-click the `Start.bat` file! This will automatically create an isolated environment, install the correct dependencies (including a lightweight, optimized version of PyTorch), and start the application.
 
 *Note: On the first run, the application will prompt you to download `yt-dlp` and `FFmpeg` if they are not already in your path.*
 
@@ -48,6 +40,7 @@ A modern, streamlined GUI application for batch downloading videos from various 
 ## 📂 Project Structure
 
 - `app.py`: The main application core and GUI logic.
+- `Start.bat`: The automated one-click setup and launch script for Windows.
 - `release_app.py`: Utility script to package the app for distribution.
 - `requirements.txt`: Python dependencies.
 - `.gitignore`: Excludes local configurations and large binaries from the repository.

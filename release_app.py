@@ -15,6 +15,7 @@ def create_release():
     # Files and folders to include
     include = [
         "app.py",
+        "Start.bat",
         "requirements.txt",
         "cookies.txt",           # Empty or user provided
         "config.json"

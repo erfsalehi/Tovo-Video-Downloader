@@ -12,6 +12,8 @@ cookies.txt
 yt-dlp.exe
 ffmpeg.exe
 ffmpeg.zip
+deno.exe
+deno.zip
 *.zip
 
 # Virtual environments
