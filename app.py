@@ -276,6 +276,14 @@ class AppleStyleApp:
         # Dependency check on startup
         self.root.after(500, self.check_dependencies)
 
+    def format_time(self, seconds):
+        """Converts seconds to SRT timestamp format (HH:MM:SS,mmm)"""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        ms = int((seconds % 1) * 1000)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
+
     def check_dependencies(self):
         """
         Verifies that yt-dlp and FFmpeg are present on the system.
@@ -582,12 +590,21 @@ class AppleStyleApp:
         Iterates through the batch list, calls yt-dlp via subprocess,
         and handles subtitle generation (standard or Whisper AI).
         """
-        def format_time(seconds):
-            hours = seconds // 3600
-            minutes = (seconds % 3600) // 60
-            secs = seconds % 60
-            ms = 0
-            return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
+        # Dynamic libraries for heavy AI operations (imported on demand to keep startup fast)
+        stable_whisper = None
+        _whisper = None
+        if sync_mode == "Whisper AI (Smart Sync)":
+            try:
+                import stable_whisper as sw
+                import whisper as w
+                import warnings
+                import torch
+                stable_whisper = sw
+                _whisper = w
+                warnings.filterwarnings("ignore")
+            except ImportError:
+                self.log("[!] Error: Whisper or Torch not found in environment. Falling back to standard sync.")
+                sync_mode = "None (2-second intervals)"
 
         try:
             # Save a text file with all titles and links
@@ -681,81 +698,27 @@ class AppleStyleApp:
                     if subs:
                         srt_path = os.path.join(self.downloads_dir, f"{title} (SRT).srt")
                         whisper_success = False
-                        
-                        if sync_mode == "Whisper AI (Smart Sync)":
+                                                if sync_mode == "Whisper AI (Smart Sync)" and stable_whisper:
                             if self.cancelled: break
-                            # Check for a matching dub audio file in the selected dub folder
-                            audio_source = None
-                            if hasattr(self, 'dub_dir') and self.dub_dir:
-                                possible_exts = ['.mp3', '.wav', '.m4a']
-                                for ext in possible_exts:
-                                    dub_path = os.path.join(self.dub_dir, f"{title}{ext}")
-                                    if os.path.exists(dub_path):
-                                        audio_source = dub_path
-                                        self.log(f"-> Found dub track: {title}{ext} - Syncing with Whisper AI!")
-                                        break
                             
+                            audio_source = self._get_dub_track(title)
                             if audio_source:
                                 self.log(f"-> Starting Whisper Smart Sync... (This may take a minute)")
                                 try:
-                                    if self.cancelled: raise Exception("Cancelled")
-                                    import stable_whisper
-                                    import whisper as _whisper
-                                    import warnings
-                                    import torch
-                                    warnings.filterwarnings("ignore")
-                                    
-                                    # Load model
-                                    model = stable_whisper.load_model('base')
-                                    
-                                    if self.cancelled: raise Exception("Cancelled")
-                                    # Manual language detection using the whisper package directly
-                                    self.log("-> Analyzing audio for language detection...")
-                                    audio = _whisper.load_audio(audio_source)
-                                    audio = _whisper.pad_or_trim(audio)
-                                    mel = _whisper.log_mel_spectrogram(audio).to(model.device)
-                                    _, probs = model.detect_language(mel)
-                                    detected_lang = max(probs, key=probs.get)
-                                    self.log(f"-> Detected language: '{detected_lang}'")
-
-                                    text_to_align = "\n".join([line for line in subs if line.strip()])
-                                    
-                                    if self.cancelled: raise Exception("Cancelled")
-                                    # Perform alignment - using positional arguments for language to be safe
-                                    self.log(f"-> Syncing {len(subs)} lines...")
-                                    result = model.align(audio_source, text_to_align, detected_lang)
-                                    result.to_srt_vtt(srt_path, word_level=False)
-                                    
-                                    self.log(f"-> Whisper Sync successful! SRT saved.")
-                                    whisper_success = True
+                                    whisper_success = self.sync_with_whisper(
+                                        stable_whisper, _whisper, audio_source, subs, srt_path
+                                    )
                                 except Exception as e:
-                                    if str(e) == "Cancelled":
-                                        pass
-                                    else:
-                                        import traceback
-                                        err_detail = traceback.format_exc()
-                                        self.log(f"-> Error with Whisper Sync: {str(e)}")
-                                        errors_found.append(f"Whisper Error for '{title}': {str(e)}")
-                                        print(err_detail) # Log full traceback to console/terminal
-                                        self.log("-> Falling back to 2-second timestamps...")
+                                    self.log(f"-> Error with Whisper Sync: {str(e)}")
+                                    errors_found.append(f"Whisper Error for '{title}': {str(e)}")
+                                    self.log("-> Falling back to 2-second timestamps...")
                             else:
                                 self.log(f"-> No matching dub found in folder. Falling back to 2-second timestamps.")
                         
                         # Fallback Or Standard Option
                         if not whisper_success and not self.cancelled:
-                            try:
-                                with open(srt_path, 'w', encoding='utf-8') as f:
-                                    current_time = 0
-                                    for j, sub_line in enumerate(subs, 1):
-                                        f.write(f"{j}\n")
-                                        start_time_str = format_time(current_time)
-                                        current_time += 2
-                                        end_time_str = format_time(current_time)
-                                        f.write(f"{start_time_str} --> {end_time_str}\n")
-                                        f.write(f"{sub_line}\n\n")
-                                self.log(f"-> Created standard SRT file with {len(subs)} lines (2s intervals).")
-                            except Exception as e:
-                                self.log(f"-> Error creating SRT: {str(e)}")
+                            self.generate_standard_srt(subs, srt_path)
+
                                 
                 else:
                     self.log(f"-> Error downloading: {title} (Return code: {return_code})")
@@ -782,6 +745,122 @@ class AppleStyleApp:
             else:
                 self.log("\nBatch download complete.")
             self.root.after(0, self.reset_ui)
+            
+    def _get_dub_track(self, title):
+        """Helper to find a matching audio file in the dub folder"""
+        if hasattr(self, 'dub_dir') and self.dub_dir:
+            possible_exts = ['.mp3', '.wav', '.m4a']
+            for ext in possible_exts:
+                dub_path = os.path.join(self.dub_dir, f"{title}{ext}")
+                if os.path.exists(dub_path):
+                    self.log(f"-> Found dub track: {title}{ext} - Syncing with Whisper AI!")
+                    return dub_path
+        return None
+
+    def sync_with_whisper(self, stable_whisper, _whisper, audio_source, subs, srt_path):
+        """
+        Orchestrates Whisper AI alignment and custom SRT fanning for unaligned text.
+        
+        This method uses stable-whisper to align text to audio. If text extends past 
+        the audio (e.g. original video voice after a dub ends), it automatically 
+        fans out the remaining subtitles into sequential 2-second intervals.
+        """
+        if self.cancelled: return False
+        
+        # Load model
+        model = stable_whisper.load_model('base')
+        
+        if self.cancelled: return False
+        # Manual language detection
+        self.log("-> Analyzing audio for language detection...")
+        audio = _whisper.load_audio(audio_source)
+        audio_duration = audio.shape[0] / 16000.0
+        
+        trimmed_audio = _whisper.pad_or_trim(audio)
+        mel = _whisper.log_mel_spectrogram(trimmed_audio).to(model.device)
+        _, probs = model.detect_language(mel)
+        detected_lang = max(probs, key=probs.get)
+        self.log(f"-> Detected language: '{detected_lang}'")
+
+        valid_subs = [line for line in subs if line.strip()]
+        text_to_align = "\n".join(valid_subs)
+        
+        if self.cancelled: return False
+        self.log(f"-> Syncing {len(valid_subs)} lines...")
+        result = model.align(audio_source, text_to_align, detected_lang)
+        
+        # Map words back to original lines to handle trailing text
+        all_words = []
+        for s in result.segments:
+            all_words.extend(getattr(s, 'words', []))
+            
+        line_word_mapping = []
+        word_idx = 0
+        for line in valid_subs:
+            line_clean = line.replace(" ", "").replace("\n", "")
+            chars_matched = 0
+            words_for_line = []
+            while chars_matched < len(line_clean) and word_idx < len(all_words):
+                w = all_words[word_idx]
+                w_clean = w.word.replace(" ", "")
+                chars_matched += len(w_clean)
+                words_for_line.append(w)
+                word_idx += 1
+            line_word_mapping.append(words_for_line)
+            
+        with open(srt_path, 'w', encoding='utf-8') as f:
+            current_unaligned_time = None
+            
+            for i, (line_text, words_in_line) in enumerate(zip(valid_subs, line_word_mapping), 1):
+                if not words_in_line:
+                    continue
+                    
+                is_unaligned = all((w.start == w.end or w.start >= audio_duration - 0.5) for w in words_in_line)
+                if current_unaligned_time is not None:
+                    is_unaligned = True
+                    
+                if is_unaligned:
+                    if current_unaligned_time is None:
+                        last_end = 0
+                        for prev_line_words in line_word_mapping[:i-1]:
+                            for pw in prev_line_words:
+                                if pw.start != pw.end and pw.end < audio_duration - 0.5:
+                                    last_end = max(last_end, pw.end)
+                        current_unaligned_time = last_end if last_end > 0 else audio_duration
+                        
+                    start_time = current_unaligned_time
+                    end_time = start_time + 2.0
+                    current_unaligned_time = end_time
+                else:
+                    start_time = words_in_line[0].start
+                    end_time = words_in_line[-1].end
+                    if start_time >= end_time:
+                        end_time = start_time + 2.0
+                        
+                f.write(f"{i}\n")
+                f.write(f"{self.format_time(start_time)} --> {self.format_time(end_time)}\n")
+                f.write(f"{line_text}\n\n")
+        
+        self.log(f"-> Whisper Sync successful! SRT saved.")
+        return True
+
+    def generate_standard_srt(self, subs, srt_path):
+        """Generates a simple SRT file with 2-second intervals"""
+        try:
+            with open(srt_path, 'w', encoding='utf-8') as f:
+                current_time = 0
+                for j, sub_line in enumerate(subs, 1):
+                    f.write(f"{j}\n")
+                    start_time_str = self.format_time(current_time)
+                    current_time += 2
+                    end_time_str = self.format_time(current_time)
+                    f.write(f"{start_time_str} --> {end_time_str}\n")
+                    f.write(f"{sub_line}\n\n")
+            self.log(f"-> Created standard SRT file with {len(subs)} lines (2s intervals).")
+            return True
+        except Exception as e:
+            self.log(f"-> Error creating SRT: {str(e)}")
+            return False
 
     def reset_ui(self):
         self.downloading = False
