@@ -698,7 +698,7 @@ class AppleStyleApp:
                     if subs:
                         srt_path = os.path.join(self.downloads_dir, f"{title} (SRT).srt")
                         whisper_success = False
-                                                if sync_mode == "Whisper AI (Smart Sync)" and stable_whisper:
+                        if sync_mode == "Whisper AI (Smart Sync)" and stable_whisper:
                             if self.cancelled: break
                             
                             audio_source = self._get_dub_track(title)
