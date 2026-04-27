@@ -20,9 +20,10 @@ A modern, streamlined GUI application for batch downloading videos from various 
    ```
 
 2. **Run the App**:
-   Simply double-click the `Start.bat` file! This will automatically create an isolated environment, install the correct dependencies (including a lightweight, optimized version of PyTorch), and start the application.
+   - **Windows**: Double-click `Start.bat`. It creates an isolated venv, installs a lightweight CPU-only PyTorch, and launches the app.
+   - **Linux / macOS**: Run `./start.sh` in a terminal. Note: Whisper smart-sync requires `torch` and `torchaudio` (`pip install torch torchaudio` inside the venv).
 
-*Note: On the first run, the application will prompt you to download `yt-dlp` and `FFmpeg` if they are not already in your path.*
+*Note: On the first run (Windows), the application will prompt you to download `yt-dlp`, `FFmpeg`, and `Deno` if they are not already on your PATH. On Linux/macOS install them via your package manager (e.g. `brew install ffmpeg deno yt-dlp`).*
 
 ## 📖 How to Use
 
@@ -39,9 +40,13 @@ A modern, streamlined GUI application for batch downloading videos from various 
 
 ## 📂 Project Structure
 
-- `app.py`: The main application core and GUI logic.
-- `Start.bat`: The automated one-click setup and launch script for Windows.
-- `release_app.py`: Utility script to package the app for distribution.
+- `app.py`: GUI entry point and download orchestration.
+- `widgets.py`: Custom Tkinter widgets (rounded buttons, etc.).
+- `dependencies.py`: Bootstrap downloader for `yt-dlp`, `ffmpeg`, and `deno`.
+- `subtitles.py`: SRT generation and Whisper-based alignment.
+- `config.py`: Persistent settings with atomic JSON writes.
+- `Start.bat` / `start.sh`: Windows / Unix launcher scripts.
+- `release_app.py`: Utility to package the app for distribution.
 - `requirements.txt`: Python dependencies.
 - `.gitignore`: Excludes local configurations and large binaries from the repository.
 
