@@ -1,42 +1,47 @@
-import os
-import zipfile
-import shutil
+"""Bundle the application into a portable ZIP for distribution.
 
-def create_release():
-    """
-    Bundles the application into a portable ZIP file.
-    Includes core scripts, requirements, and empty configuration/data folders.
-    Excludes large binaries and local user data to keep the release lightweight.
-    """
-    project_dir = os.path.dirname(os.path.abspath(__file__))
-    release_name = "Video_Downloader_Portable.zip"
-    release_path = os.path.join(project_dir, release_name)
-    
-    # Files and folders to include
-    include = [
-        "app.py",
-        "Start.bat",
-        "requirements.txt",
-        "cookies.txt",           # Empty or user provided
-        "config.json"
-    ]
-    
-    print(f"Creating release: {release_name}...")
-    
-    with zipfile.ZipFile(release_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        for file in include:
-            file_path = os.path.join(project_dir, file)
-            if os.path.exists(file_path):
-                print(f"  Adding {file}...")
-                zipf.write(file_path, file)
+User-private files (config.json, cookies.txt) are intentionally excluded.
+"""
+from __future__ import annotations
+
+import zipfile
+from pathlib import Path
+
+RELEASE_NAME = "Video_Downloader_Portable.zip"
+
+INCLUDE = (
+    "app.py",
+    "config.py",
+    "dependencies.py",
+    "subtitles.py",
+    "widgets.py",
+    "Start.bat",
+    "start.sh",
+    "requirements.txt",
+    "README.md",
+)
+
+
+def create_release() -> Path:
+    project_dir = Path(__file__).resolve().parent
+    release_path = project_dir / RELEASE_NAME
+
+    print(f"Creating release: {RELEASE_NAME}...")
+
+    with zipfile.ZipFile(release_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for name in INCLUDE:
+            file_path = project_dir / name
+            if file_path.exists():
+                print(f"  Adding {name}...")
+                zipf.write(file_path, name)
             else:
-                print(f"  Skipping {file} (not found)")
-                
-        # Create an empty Downloads folder in the zip
-        zipf.writestr('Downloads/', '')
-        
+                print(f"  Skipping {name} (not found)")
+        zipf.writestr("Downloads/", "")
+
     print(f"\nSuccess! Release bundle created at: {release_path}")
     print("You can now share this ZIP file with others.")
+    return release_path
+
 
 if __name__ == "__main__":
     create_release()

@@ -1,883 +1,730 @@
-import tkinter as tk
-from tkinter import messagebox, filedialog, ttk
-import threading
-import subprocess
+"""Tovo Video Downloader - GUI entry point and download orchestration."""
+from __future__ import annotations
+
+import logging
 import os
-import json
-import shutil
-import urllib.request
-import zipfile
-import ssl
+import re
+import subprocess
+import threading
+import tkinter as tk
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+from typing import List, Optional, Sequence
 
-class RoundedButton(tk.Canvas):
-    """
-    A custom Tkinter widget that renders a modern, rounded button using a Canvas.
-    Supports hover effects and custom styling to match Apple-style aesthetics.
-    """
-    def __init__(self, parent, text, command=None, radius=20, bg_color="#0066CC", hover_color="#0055B3", text_color="white", font=("Segoe UI", 12, "bold"), **kwargs):
-        super().__init__(parent, bg=parent["bg"], highlightthickness=0, **kwargs)
-        self.text = text
-        self.command = command
-        self.radius = radius
-        self.bg_color = bg_color
-        self.hover_color = hover_color
-        self.text_color = text_color
-        self.font = font
-        self.disabled = False
-        self.default_bg = bg_color
-        
-        self.bind("<Configure>", self._draw)
-        self.bind("<ButtonPress-1>", self._on_press)
-        self.bind("<ButtonRelease-1>", self._on_release)
-        self.bind("<Enter>", self._on_enter)
-        self.bind("<Leave>", self._on_leave)
+from config import Config
+from dependencies import find_missing_tools, install_all
+from subtitles import WhisperAligner, generate_standard_srt
+from widgets import RoundedButton
 
-    def _draw(self, event=None):
-        self.delete("all")
-        width = self.winfo_width()
-        height = self.winfo_height()
-        if width <= 1 or height <= 1:
-            return
-            
-        r = self.radius
-        
-        self.create_polygon(
-            r, 0, width - r, 0,
-            width, 0, width, r,
-            width, height - r, width, height,
-            width - r, height, r, height,
-            0, height, 0, height - r,
-            0, r, 0, 0,
-            fill=self.bg_color, smooth=True
-        )
-        self.create_text(width / 2, height / 2, text=self.text, fill=self.text_color, font=self.font)
+logger = logging.getLogger(__name__)
 
-    def _on_press(self, event):
-        if not self.disabled:
-             # slight shade on click
-             pass
+BASE_PATH = Path(__file__).resolve().parent
+URL_PREFIXES = ("http://", "https://")
+INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+DOWNLOAD_FILE_EXTENSIONS = (".mp4", ".srt", ".txt", ".mp3", ".wav", ".m4a")
+PROCESS_TERMINATE_TIMEOUT = 5  # seconds before SIGKILL fallback
 
-    def _on_release(self, event):
-        if not self.disabled and self.command:
-            self.command()
 
-    def _on_enter(self, event):
-        if not self.disabled:
-            self.bg_color = self.hover_color
-            self._draw()
-            self.config(cursor="hand2")
-
-    def _on_leave(self, event):
-        if not self.disabled:
-            self.bg_color = self.default_bg
-            self._draw()
-            self.config(cursor="arrow")
-
-    def config_state(self, state, text=None, bg=None):
-        self.disabled = (state == 'disabled')
-        if text:
-            self.text = text
-        if bg:
-            self.bg_color = bg
-            self.default_bg = bg
-        self._draw()
-        if self.disabled:
-            self.config(cursor="arrow")
+def sanitize_filename(name: str) -> str:
+    """Strip path separators and unsafe characters from a video title."""
+    cleaned = INVALID_FILENAME_CHARS.sub("_", name).strip(" .")
+    cleaned = Path(cleaned).name  # drop any directory components
+    return cleaned or "untitled"
 
 
 class AppleStyleApp:
-    """
-    Main Application class for the Video Downloader.
-    Handles the GUI construction, user interaction, and orchestrates the download process.
-    """
-    def __init__(self, root):
+    """Main GUI window: input pane, options, log, and the download worker."""
+
+    def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Video Downloader")
         self.root.geometry("800x800")
         self.root.minsize(700, 700)
-        
-        self.config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-        self._load_config()
-        os.makedirs(self.downloads_dir, exist_ok=True)
-        
-        # Apple-like colors and fonts
+
+        self.config = Config(BASE_PATH / "config.json")
+        if not self.config.get("downloads_dir"):
+            self.config.set("downloads_dir", str(BASE_PATH / "Downloads"))
+        self.downloads_dir = Path(self.config.get("downloads_dir"))
+        self.dub_dir = self.config.get("dub_dir", "")
+        self.downloads_dir.mkdir(parents=True, exist_ok=True)
+
+        # Apple-like palette
         self.bg_color = "#F5F5F7"
-        
-        # Modern indigo/blue gradient-like palette
-        self.accent_color = "#5E5CE6" # Modern iOS Indigo
+        self.accent_color = "#5E5CE6"
         self.accent_hover = "#4B49B8"
         self.text_color = "#1D1D1F"
-        
-        # Clean gray
         self.gray_bg = "#E5E5EA"
         self.gray_hover = "#D1D1D6"
-        
-        self.font_family = "Segoe UI" if os.name == 'nt' else "Helvetica"
-        
+        self.font_family = "Segoe UI" if os.name == "nt" else "Helvetica"
+
+        self._state_lock = threading.Lock()
+        self.downloading = False
+        self.cancelled = False
+        self.current_process: Optional[subprocess.Popen] = None
+
         self.root.configure(bg=self.bg_color)
-        
-        # Grid config for root
+        self._build_ui()
+
+        self.root.after(500, self.check_dependencies)
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+    def _build_ui(self) -> None:
         self.root.grid_columnconfigure(0, weight=1)
         self.root.grid_rowconfigure(0, weight=1)
 
-        # Main container
-        self.main_frame = tk.Frame(root, bg=self.bg_color)
+        self.main_frame = tk.Frame(self.root, bg=self.bg_color)
         self.main_frame.grid(row=0, column=0, sticky="nsew", padx=35, pady=20)
-        
         self.main_frame.grid_columnconfigure(0, weight=1)
-        self.main_frame.grid_rowconfigure(2, weight=1) 
+        self.main_frame.grid_rowconfigure(2, weight=1)
 
-        # Row 0: Header
-        self.header = tk.Label(self.main_frame, text="Batch Downloader", bg=self.bg_color, fg=self.text_color, font=(self.font_family, 26, "bold"))
-        self.header.grid(row=0, column=0, sticky="w", pady=(0, 5))
-        
-        # Row 1: Subheader
-        self.subheader = tk.Label(self.main_frame, text="Paste Title on line 1, Link on line 2, Title on line 3, etc.", bg=self.bg_color, fg="#86868B", font=(self.font_family, 11))
-        self.subheader.grid(row=1, column=0, sticky="w", pady=(0, 10))
+        tk.Label(
+            self.main_frame, text="Batch Downloader", bg=self.bg_color, fg=self.text_color,
+            font=(self.font_family, 26, "bold"),
+        ).grid(row=0, column=0, sticky="w", pady=(0, 5))
 
-        # Row 2: Input Area Container
-        self.input_frame = tk.Frame(self.main_frame, bg="white", highlightbackground="#D2D2D7", highlightthickness=1)
+        tk.Label(
+            self.main_frame,
+            text="Paste Title on line 1, Link on line 2, Title on line 3, etc.",
+            bg=self.bg_color, fg="#86868B", font=(self.font_family, 11),
+        ).grid(row=1, column=0, sticky="w", pady=(0, 10))
+
+        self._build_input_area()
+        self._build_save_row()
+        self._build_options_row()
+        self._build_dub_row()
+        self._build_advanced_row()
+        self._build_button_row()
+        self._build_log_area()
+
+    def _build_input_area(self) -> None:
+        self.input_frame = tk.Frame(
+            self.main_frame, bg="white", highlightbackground="#D2D2D7", highlightthickness=1,
+        )
         self.input_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 15))
-        
-        self.input_text = tk.Text(self.input_frame, wrap=tk.WORD, font=(self.font_family, 12), bg="white", fg=self.text_color, insertbackground=self.accent_color, relief=tk.FLAT, padx=15, pady=15)
-        self.input_text.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
-        self.input_scroll = tk.Scrollbar(self.input_frame, command=self.input_text.yview)
-        self.input_scroll.pack(fill=tk.Y, side=tk.RIGHT)
-        self.input_text.config(yscrollcommand=self.input_scroll.set)
 
-        # Let's explicitly ensure it's normal and add a handy right-click menu for pasting
-        self.input_text.config(state='normal')
-        self.context_menu = tk.Menu(self.root, tearoff=0)
-        self.context_menu.add_command(label="Cut", command=lambda: self.input_text.event_generate("<<Cut>>"))
-        self.context_menu.add_command(label="Copy", command=lambda: self.input_text.event_generate("<<Copy>>"))
-        self.context_menu.add_command(label="Paste", command=lambda: self.input_text.event_generate("<<Paste>>"))
-        self.context_menu.add_separator()
-        self.context_menu.add_command(label="Select All", command=lambda: self.input_text.event_generate("<<SelectAll>>"))
-        
+        self.input_text = tk.Text(
+            self.input_frame, wrap=tk.WORD, font=(self.font_family, 12),
+            bg="white", fg=self.text_color, insertbackground=self.accent_color,
+            relief=tk.FLAT, padx=15, pady=15,
+        )
+        self.input_text.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
+        scroll = tk.Scrollbar(self.input_frame, command=self.input_text.yview)
+        scroll.pack(fill=tk.Y, side=tk.RIGHT)
+        self.input_text.config(yscrollcommand=scroll.set, state="normal")
+
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="Cut", command=lambda: self.input_text.event_generate("<<Cut>>"))
+        menu.add_command(label="Copy", command=lambda: self.input_text.event_generate("<<Copy>>"))
+        menu.add_command(label="Paste", command=lambda: self.input_text.event_generate("<<Paste>>"))
+        menu.add_separator()
+        menu.add_command(label="Select All", command=lambda: self.input_text.event_generate("<<SelectAll>>"))
+        self.context_menu = menu
+
         def show_context_menu(event):
             try:
-                self.context_menu.tk_popup(event.x_root, event.y_root)
+                menu.tk_popup(event.x_root, event.y_root)
             finally:
-                self.context_menu.grab_release()
+                menu.grab_release()
 
         self.input_text.bind("<Button-3>", show_context_menu)
 
-        # Standard Keyboard Shortcuts for Text Area
-        self.input_text.bind("<Control-a>", lambda e: self.input_text.tag_add(tk.SEL, "1.0", tk.END) or "break")
-        self.input_text.bind("<Control-c>", lambda e: self.input_text.event_generate("<<Copy>>") or "break")
-        self.input_text.bind("<Control-v>", lambda e: self.input_text.event_generate("<<Paste>>") or "break")
-        self.input_text.bind("<Control-x>", lambda e: self.input_text.event_generate("<<Cut>>") or "break")
-        # Support uppercase too just in case
-        self.input_text.bind("<Control-A>", lambda e: self.input_text.tag_add(tk.SEL, "1.0", tk.END) or "break")
-        self.input_text.bind("<Control-C>", lambda e: self.input_text.event_generate("<<Copy>>") or "break")
-        self.input_text.bind("<Control-V>", lambda e: self.input_text.event_generate("<<Paste>>") or "break")
-        self.input_text.bind("<Control-X>", lambda e: self.input_text.event_generate("<<Cut>>") or "break")
+        shortcuts = {
+            "<Control-a>": "<<SelectAll>>",
+            "<Control-A>": "<<SelectAll>>",
+            "<Control-c>": "<<Copy>>",
+            "<Control-C>": "<<Copy>>",
+            "<Control-v>": "<<Paste>>",
+            "<Control-V>": "<<Paste>>",
+            "<Control-x>": "<<Cut>>",
+            "<Control-X>": "<<Cut>>",
+        }
+        for key, virtual_event in shortcuts.items():
+            if virtual_event == "<<SelectAll>>":
+                self.input_text.bind(
+                    key, lambda e: self.input_text.tag_add(tk.SEL, "1.0", tk.END) or "break"
+                )
+            else:
+                self.input_text.bind(
+                    key, lambda e, ve=virtual_event: self.input_text.event_generate(ve) or "break"
+                )
 
-        # Row 3: Save Location & Browse
-        self.save_frame = tk.Frame(self.main_frame, bg=self.bg_color)
-        self.save_frame.grid(row=3, column=0, sticky="ew", pady=(0, 15))
-        self.save_frame.grid_columnconfigure(1, weight=1)
-        
-        tk.Label(self.save_frame, text="Save to:", bg=self.bg_color, fg=self.text_color, font=(self.font_family, 11, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 10))
-        self.dir_label = tk.Label(self.save_frame, text=self.downloads_dir, bg=self.bg_color, fg="#555555", font=(self.font_family, 10))
+    def _build_save_row(self) -> None:
+        frame = tk.Frame(self.main_frame, bg=self.bg_color)
+        frame.grid(row=3, column=0, sticky="ew", pady=(0, 15))
+        frame.grid_columnconfigure(1, weight=1)
+
+        tk.Label(
+            frame, text="Save to:", bg=self.bg_color, fg=self.text_color,
+            font=(self.font_family, 11, "bold"),
+        ).grid(row=0, column=0, sticky="w", padx=(0, 10))
+
+        self.dir_label = tk.Label(
+            frame, text=str(self.downloads_dir), bg=self.bg_color, fg="#555555",
+            font=(self.font_family, 10),
+        )
         self.dir_label.grid(row=0, column=1, sticky="w")
-        
-        # Modern Flat Rounded Browse Button
+
         self.browse_btn = RoundedButton(
-            self.save_frame, text="Browse...", command=self.browse_directory,
-            radius=15, bg_color=self.gray_bg, hover_color=self.gray_hover, text_color=self.text_color,
-            font=(self.font_family, 10, "bold"), width=100, height=35
+            frame, text="Browse...", command=self.browse_directory,
+            radius=15, bg_color=self.gray_bg, hover_color=self.gray_hover,
+            text_color=self.text_color, font=(self.font_family, 10, "bold"),
+            width=100, height=35,
         )
         self.browse_btn.grid(row=0, column=2, sticky="e")
 
-        # Row 4: Options Frame
-        self.options_frame = tk.Frame(self.main_frame, bg=self.bg_color)
-        self.options_frame.grid(row=4, column=0, sticky="ew", pady=(0, 15))
-        
-        tk.Label(self.options_frame, text="Subtitle Sync Mode:", bg=self.bg_color, fg=self.text_color, font=(self.font_family, 11, "bold")).pack(side=tk.LEFT, padx=(0, 10))
-        
-        self.sync_mode_var = tk.StringVar(value="None (2-second intervals)")
-        self.sync_combo = ttk.Combobox(self.options_frame, textvariable=self.sync_mode_var, values=["None (2-second intervals)", "Whisper AI (Smart Sync)"], state="readonly", font=(self.font_family, 10))
-        self.sync_combo.pack(side=tk.LEFT)
+    def _build_options_row(self) -> None:
+        frame = tk.Frame(self.main_frame, bg=self.bg_color)
+        frame.grid(row=4, column=0, sticky="ew", pady=(0, 15))
 
-        # Row 5: Dub Audio Location & Browse
-        self.dub_frame = tk.Frame(self.main_frame, bg=self.bg_color)
-        self.dub_frame.grid(row=5, column=0, sticky="ew", pady=(0, 15))
-        self.dub_frame.grid_columnconfigure(1, weight=1)
-        
-        tk.Label(self.dub_frame, text="(Optional) Dub Folder:", bg=self.bg_color, fg=self.text_color, font=(self.font_family, 11, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 10))
-        
+        tk.Label(
+            frame, text="Subtitle Sync Mode:", bg=self.bg_color, fg=self.text_color,
+            font=(self.font_family, 11, "bold"),
+        ).pack(side=tk.LEFT, padx=(0, 10))
+
+        self.sync_mode_var = tk.StringVar(value="None (2-second intervals)")
+        ttk.Combobox(
+            frame, textvariable=self.sync_mode_var,
+            values=["None (2-second intervals)", "Whisper AI (Smart Sync)"],
+            state="readonly", font=(self.font_family, 10),
+        ).pack(side=tk.LEFT)
+
+    def _build_dub_row(self) -> None:
+        frame = tk.Frame(self.main_frame, bg=self.bg_color)
+        frame.grid(row=5, column=0, sticky="ew", pady=(0, 15))
+        frame.grid_columnconfigure(1, weight=1)
+
+        tk.Label(
+            frame, text="(Optional) Dub Folder:", bg=self.bg_color, fg=self.text_color,
+            font=(self.font_family, 11, "bold"),
+        ).grid(row=0, column=0, sticky="w", padx=(0, 10))
+
         dub_label_text = self.dub_dir if self.dub_dir else "Not Selected (Uses Video Audio)"
-        self.dub_dir_label = tk.Label(self.dub_frame, text=dub_label_text, bg=self.bg_color, fg="#555555", font=(self.font_family, 10))
+        self.dub_dir_label = tk.Label(
+            frame, text=dub_label_text, bg=self.bg_color, fg="#555555",
+            font=(self.font_family, 10),
+        )
         self.dub_dir_label.grid(row=0, column=1, sticky="w")
-        
+
         self.dub_browse_btn = RoundedButton(
-            self.dub_frame, text="Browse...", command=self.browse_dub_directory,
-            radius=15, bg_color=self.gray_bg, hover_color=self.gray_hover, text_color=self.text_color,
-            font=(self.font_family, 10, "bold"), width=100, height=35
+            frame, text="Browse...", command=self.browse_dub_directory,
+            radius=15, bg_color=self.gray_bg, hover_color=self.gray_hover,
+            text_color=self.text_color, font=(self.font_family, 10, "bold"),
+            width=100, height=35,
         )
         self.dub_browse_btn.grid(row=0, column=2, sticky="e")
 
-        
-        # Row 6: Advanced Options (Cookies)
-        self.advanced_frame = tk.Frame(self.main_frame, bg=self.bg_color)
-        self.advanced_frame.grid(row=6, column=0, sticky="ew", pady=(0, 15))
-        
+    def _build_advanced_row(self) -> None:
+        frame = tk.Frame(self.main_frame, bg=self.bg_color)
+        frame.grid(row=6, column=0, sticky="ew", pady=(0, 15))
+
         self.use_browser_cookies = tk.BooleanVar(value=self.config.get("use_browser_cookies", False))
-        self.cookies_check = tk.Checkbutton(
-            self.advanced_frame, text="Use Chrome Cookies (as fallback)", 
+        tk.Checkbutton(
+            frame, text="Use Chrome Cookies (as fallback)",
             variable=self.use_browser_cookies, bg=self.bg_color, activebackground=self.bg_color,
-            fg=self.text_color, font=(self.font_family, 10), command=self._save_config
-        )
-        self.cookies_check.pack(side=tk.LEFT)
-        
-        # Option to clear cookies file if it's causing issues
-        self.clear_cookies_btn = tk.Button(
-            self.advanced_frame, text="Clear local cookies.txt", font=(self.font_family, 9),
-            command=self.clear_local_cookies, bg=self.gray_bg, relief=tk.FLAT
-        )
-        self.clear_cookies_btn.pack(side=tk.RIGHT)
+            fg=self.text_color, font=(self.font_family, 10),
+            command=self._save_config,
+        ).pack(side=tk.LEFT)
 
+        tk.Button(
+            frame, text="Clear local cookies.txt", font=(self.font_family, 9),
+            command=self.clear_local_cookies, bg=self.gray_bg, relief=tk.FLAT,
+        ).pack(side=tk.RIGHT)
 
-        self.button_frame = tk.Frame(self.main_frame, bg=self.bg_color)
-        self.button_frame.grid(row=7, column=0, sticky="ew", pady=(0, 20))
-        self.button_frame.grid_columnconfigure(0, weight=1)
-        self.button_frame.grid_columnconfigure(1, weight=1)
+    def _build_button_row(self) -> None:
+        frame = tk.Frame(self.main_frame, bg=self.bg_color)
+        frame.grid(row=7, column=0, sticky="ew", pady=(0, 20))
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_columnconfigure(1, weight=1)
 
         self.download_btn = RoundedButton(
-            self.button_frame, text="Start Download", command=self.start_download,
-            radius=20, bg_color=self.accent_color, hover_color=self.accent_hover, text_color="white",
-            font=(self.font_family, 13, "bold"), height=50
+            frame, text="Start Download", command=self.start_download,
+            radius=20, bg_color=self.accent_color, hover_color=self.accent_hover,
+            text_color="white", font=(self.font_family, 13, "bold"), height=50,
         )
         self.download_btn.grid(row=0, column=0, sticky="ew", padx=(0, 10))
 
         self.cancel_btn = RoundedButton(
-            self.button_frame, text="Cancel", command=self.cancel_download,
-            radius=20, bg_color="#FF3B30", hover_color="#D70A01", text_color="white",
-            font=(self.font_family, 13, "bold"), height=50
+            frame, text="Cancel", command=self.cancel_download,
+            radius=20, bg_color="#FF3B30", hover_color="#D70A01",
+            text_color="white", font=(self.font_family, 13, "bold"), height=50,
         )
         self.cancel_btn.grid(row=0, column=1, sticky="ew")
-        self.cancel_btn.config_state('disabled', bg="#E5E5EA")
+        self.cancel_btn.config_state("disabled", bg="#E5E5EA")
 
-        # Row 8: Log Area
-        self.log_frame = tk.Frame(self.main_frame, bg="#1D1D1F", highlightbackground="#D2D2D7", highlightthickness=1)
-        self.log_frame.grid(row=8, column=0, sticky="ew")
-        
-        self.log_text = tk.Text(self.log_frame, wrap=tk.WORD, height=7, font=("Consolas", 10), bg="#1D1D1F", fg="#F5F5F7", insertbackground="#1D1D1F", relief=tk.FLAT, padx=12, pady=12, state='disabled')
+    def _build_log_area(self) -> None:
+        frame = tk.Frame(
+            self.main_frame, bg="#1D1D1F",
+            highlightbackground="#D2D2D7", highlightthickness=1,
+        )
+        frame.grid(row=8, column=0, sticky="ew")
+
+        self.log_text = tk.Text(
+            frame, wrap=tk.WORD, height=7, font=("Consolas", 10),
+            bg="#1D1D1F", fg="#F5F5F7", insertbackground="#1D1D1F",
+            relief=tk.FLAT, padx=12, pady=12, state="disabled",
+        )
         self.log_text.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
-        self.log_scroll = tk.Scrollbar(self.log_frame, command=self.log_text.yview)
-        self.log_scroll.pack(fill=tk.Y, side=tk.RIGHT)
-        self.log_text.config(yscrollcommand=self.log_scroll.set)
-        
-        self.downloading = False
-        self.cancelled = False
-        self.current_process = None
+        scroll = tk.Scrollbar(frame, command=self.log_text.yview)
+        scroll.pack(fill=tk.Y, side=tk.RIGHT)
+        self.log_text.config(yscrollcommand=scroll.set)
 
-        # Dependency check on startup
-        self.root.after(500, self.check_dependencies)
+    # ------------------------------------------------------------------
+    # Config / browsing
+    # ------------------------------------------------------------------
+    def _save_config(self) -> None:
+        self.config.set("downloads_dir", str(self.downloads_dir))
+        self.config.set("dub_dir", self.dub_dir)
+        self.config.set("use_browser_cookies", self.use_browser_cookies.get())
+        self.config.save()
 
-    def format_time(self, seconds):
-        """Converts seconds to SRT timestamp format (HH:MM:SS,mmm)"""
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        secs = int(seconds % 60)
-        ms = int((seconds % 1) * 1000)
-        return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
-
-    def check_dependencies(self):
-        """
-        Verifies that yt-dlp and FFmpeg are present on the system.
-        If missing, it offers the user to download them automatically.
-        """
-        missing = []
-        
-        # Check for yt-dlp
-        yt_dlp_local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yt-dlp.exe")
-        if not (shutil.which("yt-dlp") or os.path.exists(yt_dlp_local)):
-            missing.append("yt-dlp")
-            
-        # Check for ffmpeg
-        ffmpeg_local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ffmpeg.exe")
-        if not (shutil.which("ffmpeg") or os.path.exists(ffmpeg_local)):
-            missing.append("FFmpeg")
-            
-        # Check for Deno (JS Runtime for yt-dlp)
-        deno_local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deno.exe")
-        if not (shutil.which("deno") or os.path.exists(deno_local)):
-            missing.append("Deno (JS Runtime)")
-            
-        if missing:
-            msg = f"The following essential tools are missing:\n\n" + "\n".join([f"• {m}" for m in missing])
-            msg += "\n\nWithout these, downloads and high-quality processing may be restricted."
-            msg += "\n\nWould you like the app to download them automatically for you?"
-            
-            if messagebox.askyesno("Missing Dependencies", msg):
-                threading.Thread(target=self.download_tools, daemon=True).start()
-            else:
-                self.log("[!] Warning: Missing dependencies. App may not function correctly.")
-
-    def download_tools(self):
-        """
-        Automates the download and extraction of yt-dlp.exe, ffmpeg.exe, and deno.exe.
-        Uses urllib with a User-Agent to prevent blocks and ensuring all handles are closed.
-        """
-        self.log("--- Starting Dependency Setup ---")
-        base_path = os.path.dirname(os.path.abspath(__file__))
-        
-        # Bypass SSL verification for some environments
-        context = ssl._create_unverified_context()
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-        
-        try:
-            # 1. Download yt-dlp.exe
-            yt_dlp_path = os.path.join(base_path, "yt-dlp.exe")
-            if not os.path.exists(yt_dlp_path):
-                self.log("-> Downloading yt-dlp.exe...")
-                url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
-                req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, context=context) as response, open(yt_dlp_path, 'wb') as out_file:
-                    shutil.copyfileobj(response, out_file)
-                self.log("   Done!")
-
-            # 2. Download FFmpeg
-            ffmpeg_path = os.path.join(base_path, "ffmpeg.exe")
-            if not os.path.exists(ffmpeg_path):
-                self.log("-> Downloading FFmpeg (This may take a moment)...")
-                zip_url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
-                temp_zip = os.path.join(base_path, "ffmpeg.zip")
-                
-                try:
-                    req = urllib.request.Request(zip_url, headers=headers)
-                    with urllib.request.urlopen(req, context=context) as response, open(temp_zip, 'wb') as out_file:
-                        shutil.copyfileobj(response, out_file)
-                        
-                    self.log("-> Extracting FFmpeg...")
-                    with zipfile.ZipFile(temp_zip, 'r') as zip_ref:
-                        for member in zip_ref.namelist():
-                            if member.endswith("ffmpeg.exe"):
-                                with zip_ref.open(member) as source:
-                                    with open(ffmpeg_path, 'wb') as target:
-                                        shutil.copyfileobj(source, target)
-                                break
-                except zipfile.BadZipFile:
-                    self.log("-> Error: FFmpeg download was corrupted (Invalid ZIP). Please try again.")
-                    if os.path.exists(ffmpeg_path): os.remove(ffmpeg_path)
-                finally:
-                    if os.path.exists(temp_zip):
-                        try:
-                            os.remove(temp_zip)
-                        except Exception as e:
-                            self.log(f"-> Warning: Could not remove temporary zip: {str(e)}")
-                
-                if os.path.exists(ffmpeg_path):
-                    self.log("   Done!")
-                else:
-                    raise Exception("FFmpeg extraction failed.")
-
-            # 3. Download Deno
-            deno_path = os.path.join(base_path, "deno.exe")
-            if not os.path.exists(deno_path):
-                self.log("-> Downloading Deno (JS Runtime for YouTube extraction)...")
-                deno_url = "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip"
-                temp_deno_zip = os.path.join(base_path, "deno.zip")
-                
-                try:
-                    req = urllib.request.Request(deno_url, headers=headers)
-                    with urllib.request.urlopen(req, context=context) as response, open(temp_deno_zip, 'wb') as out_file:
-                        shutil.copyfileobj(response, out_file)
-                    
-                    self.log("-> Extracting Deno...")
-                    with zipfile.ZipFile(temp_deno_zip, 'r') as zip_ref:
-                        zip_ref.extractall(base_path)
-                except zipfile.BadZipFile:
-                    self.log("-> Error: Deno download was corrupted. Please try again.")
-                finally:
-                    if os.path.exists(temp_deno_zip):
-                        try:
-                            os.remove(temp_deno_zip)
-                        except Exception as e:
-                            self.log(f"-> Warning: Could not remove temporary zip: {str(e)}")
-                
-                if os.path.exists(deno_path):
-                    self.log("   Done!")
-                else:
-                    raise Exception("Deno extraction failed.")
-                
-            self.log("--- Setup Complete! You are ready to go. ---")
-            messagebox.showinfo("Setup Complete", "All dependencies have been downloaded and installed successfully.")
-            
-        except Exception as e:
-            self.log(f"-> Error during setup: {str(e)}")
-            messagebox.showerror("Setup Error", f"Failed to download dependencies: {str(e)}\n\nPlease install them manually.")
-
-    def _load_config(self):
-        default_downloads = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Downloads")
-        try:
-            with open(self.config_path, 'r') as f:
-                self.config = json.load(f)
-            self.downloads_dir = self.config.get("downloads_dir", default_downloads)
-            self.dub_dir = self.config.get("dub_dir", "")
-        except Exception:
-            self.config = {}
-            self.downloads_dir = default_downloads
-            self.dub_dir = ""
-            
-    def clear_local_cookies(self):
-        cookies_txt = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
-        if os.path.exists(cookies_txt):
-            if messagebox.askyesno("Clear Cookies", "Are you sure you want to delete the local cookies.txt file? This may help if you're getting authentication errors."):
-                try:
-                    os.remove(cookies_txt)
-                    self.log("-> Removed local cookies.txt")
-                except Exception as e:
-                    self.log(f"-> Error removing cookies: {str(e)}")
-        else:
-            messagebox.showinfo("Clear Cookies", "No local cookies.txt found.")
-
-    def _save_config(self):
-        try:
-            with open(self.config_path, 'w') as f:
-                json.dump({
-                    "downloads_dir": self.downloads_dir, 
-                    "dub_dir": self.dub_dir,
-                    "use_browser_cookies": self.use_browser_cookies.get()
-                }, f)
-        except Exception:
-            pass
-
-    def browse_directory(self):
-        selected_dir = filedialog.askdirectory(initialdir=self.downloads_dir, title="Select Save Location")
-        if selected_dir:
-            self.downloads_dir = os.path.normpath(selected_dir)
-            self.dir_label.config(text=self.downloads_dir)
+    def browse_directory(self) -> None:
+        selected = filedialog.askdirectory(
+            initialdir=str(self.downloads_dir), title="Select Save Location",
+        )
+        if selected:
+            self.downloads_dir = Path(selected)
+            self.dir_label.config(text=str(self.downloads_dir))
             self._save_config()
 
-    def browse_dub_directory(self):
-        selected_dir = filedialog.askdirectory(title="Select Dub Audio Folder")
-        if selected_dir:
-            self.dub_dir = os.path.normpath(selected_dir)
+    def browse_dub_directory(self) -> None:
+        selected = filedialog.askdirectory(title="Select Dub Audio Folder")
+        if selected:
+            self.dub_dir = os.path.normpath(selected)
             self.dub_dir_label.config(text=self.dub_dir)
             self._save_config()
 
+    def clear_local_cookies(self) -> None:
+        cookies_txt = BASE_PATH / "cookies.txt"
+        if not cookies_txt.exists():
+            messagebox.showinfo("Clear Cookies", "No local cookies.txt found.")
+            return
+        if not messagebox.askyesno(
+            "Clear Cookies",
+            "Are you sure you want to delete the local cookies.txt file? "
+            "This may help if you're getting authentication errors.",
+        ):
+            return
+        try:
+            cookies_txt.unlink()
+            self.log("-> Removed local cookies.txt")
+        except OSError as e:
+            self.log(f"-> Error removing cookies: {e}")
 
-    def cancel_download(self):
-        if self.downloading and not self.cancelled:
-            self.cancelled = True
-            self.log("\n[!] Cancellation requested. Stopping process...")
-            if self.current_process:
-                try:
-                    # On Windows, taskkill /F /T kills the process and its children
-                    if os.name == 'nt':
-                        subprocess.run(['taskkill', '/F', '/T', '/PID', str(self.current_process.pid)], capture_output=True)
-                    else:
-                        self.current_process.terminate()
-                except Exception as e:
-                    self.log(f"-> Error cancelling process: {str(e)}")
-            self.reset_ui()
-
-    def log(self, message):
-        self.log_text.config(state='normal')
+    # ------------------------------------------------------------------
+    # Logging
+    # ------------------------------------------------------------------
+    def log(self, message: str) -> None:
+        # Marshal to the UI thread when called from a worker.
+        if threading.current_thread() is not threading.main_thread():
+            self.root.after(0, self.log, message)
+            return
+        self.log_text.config(state="normal")
         self.log_text.insert(tk.END, message + "\n")
         self.log_text.see(tk.END)
-        self.log_text.config(state='disabled')
-        self.root.update_idletasks()
+        self.log_text.config(state="disabled")
 
-    def start_download(self):
-        """
-        Triggered by the 'Start Download' button. 
-        Parses the input text area for Title/Link pairs and optional captions,
-        validates the input, and kicks off the background download thread.
-        """
-        if self.downloading:
+    # ------------------------------------------------------------------
+    # Dependencies
+    # ------------------------------------------------------------------
+    def check_dependencies(self) -> None:
+        missing = find_missing_tools(BASE_PATH)
+        if not missing:
             return
 
-        raw_input = self.input_text.get("1.0", tk.END).strip()
-        lines = [line.strip() for line in raw_input.split('\n') if line.strip()]
+        msg = (
+            "The following essential tools are missing:\n\n"
+            + "\n".join(f"• {m}" for m in missing)
+            + "\n\nWithout these, downloads and high-quality processing may be restricted."
+            + "\n\nWould you like the app to download them automatically for you?"
+        )
+        if messagebox.askyesno("Missing Dependencies", msg):
+            threading.Thread(target=self._download_tools_thread, daemon=True).start()
+        else:
+            self.log("[!] Warning: Missing dependencies. App may not function correctly.")
 
+    def _download_tools_thread(self) -> None:
+        try:
+            install_all(BASE_PATH, self.log)
+            self.root.after(
+                0, messagebox.showinfo, "Setup Complete",
+                "All dependencies have been downloaded and installed successfully.",
+            )
+        except Exception as e:
+            logger.exception("Dependency setup failed")
+            self.log(f"-> Error during setup: {e}")
+            self.root.after(
+                0, messagebox.showerror, "Setup Error",
+                f"Failed to download dependencies: {e}\n\nPlease install them manually.",
+            )
+
+    # ------------------------------------------------------------------
+    # Cancellation / state
+    # ------------------------------------------------------------------
+    def cancel_download(self) -> None:
+        with self._state_lock:
+            if not self.downloading or self.cancelled:
+                return
+            self.cancelled = True
+            proc = self.current_process
+
+        self.log("\n[!] Cancellation requested. Stopping process...")
+        if proc is not None:
+            self._terminate_process(proc)
+        self.root.after(0, self.reset_ui)
+
+    def _terminate_process(self, proc: subprocess.Popen) -> None:
+        try:
+            if os.name == "nt":
+                # /T kills children, /F is force; capture output to avoid console spam.
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    capture_output=True, check=False,
+                )
+            else:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=PROCESS_TERMINATE_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=PROCESS_TERMINATE_TIMEOUT)
+        except OSError as e:
+            self.log(f"-> Error cancelling process: {e}")
+
+    # ------------------------------------------------------------------
+    # Input parsing / start
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _is_url(line: str) -> bool:
+        return line.lower().startswith(URL_PREFIXES)
+
+    def _parse_input(self, lines: Sequence[str]):
+        titles: List[str] = []
+        links: List[str] = []
+        subtitles_list: List[List[str]] = []
+
+        link_indices: List[int] = []
+        for i, line in enumerate(lines):
+            if self._is_url(line) and i > 0 and not self._is_url(lines[i - 1]):
+                link_indices.append(i)
+
+        for idx_pos, link_idx in enumerate(link_indices):
+            titles.append(lines[link_idx - 1])
+            links.append(lines[link_idx])
+
+            start = link_idx + 1
+            end = link_indices[idx_pos + 1] - 1 if idx_pos + 1 < len(link_indices) else len(lines)
+            subtitles_list.append(list(lines[start:end]))
+
+        return titles, links, subtitles_list
+
+    def start_download(self) -> None:
+        with self._state_lock:
+            if self.downloading:
+                return
+
+        raw_input = self.input_text.get("1.0", tk.END).strip()
+        lines = [line.strip() for line in raw_input.split("\n") if line.strip()]
         if not lines:
             messagebox.showwarning("Input Error", "Please enter at least one title and one link.")
             return
 
-        # Check for existing files and ask to cleanup
-        if os.path.exists(self.downloads_dir):
-            existing_files = [f for f in os.listdir(self.downloads_dir) if f.endswith(('.mp4', '.srt', '.txt', '.mp3', '.wav', '.m4a'))]
-            if existing_files:
-                if messagebox.askyesno("Cleanup Folder", f"Found {len(existing_files)} existing files in the download folder. Would you like to clear them first?"):
-                    for f in existing_files:
-                        try:
-                            os.remove(os.path.join(self.downloads_dir, f))
-                        except Exception as e:
-                            self.log(f"-> Warning: Could not remove {f}: {str(e)}")
+        if self.downloads_dir.exists():
+            existing = [f for f in os.listdir(self.downloads_dir)
+                        if f.endswith(DOWNLOAD_FILE_EXTENSIONS)]
+            if existing and messagebox.askyesno(
+                "Cleanup Folder",
+                f"Found {len(existing)} existing files in the download folder. "
+                "Would you like to clear them first?",
+            ):
+                for name in existing:
+                    try:
+                        (self.downloads_dir / name).unlink()
+                    except OSError as e:
+                        self.log(f"-> Warning: Could not remove {name}: {e}")
 
-        titles = []
-        links = []
-        subtitles_list = []
-        
-        link_indices = []
-        for i in range(len(lines)):
-            line = lines[i]
-            # Detect URLs to figure out where the pairs are
-            if line.startswith("http://") or line.startswith("https://"):
-                if i > 0:
-                    title_candidate = lines[i-1]
-                    # Ensure the title itself isn't a link
-                    if not (title_candidate.startswith("http://") or title_candidate.startswith("https://")):
-                        link_indices.append(i)
-
-        for idx_pos, link_idx in enumerate(link_indices):
-            title = lines[link_idx-1]
-            link = lines[link_idx]
-            titles.append(title)
-            links.append(link)
-            
-            start_subtitle_idx = link_idx + 1
-            if idx_pos + 1 < len(link_indices):
-                end_subtitle_idx = link_indices[idx_pos+1] - 1
-            else:
-                end_subtitle_idx = len(lines)
-                
-            video_subtitles = lines[start_subtitle_idx:end_subtitle_idx]
-            subtitles_list.append(video_subtitles)
-
+        titles, links, subtitles_list = self._parse_input(lines)
         if not titles:
-            messagebox.showwarning("Input Error", "Could not find any valid Title and Link pairs. Make sure every link has a title on the line above it.")
+            messagebox.showwarning(
+                "Input Error",
+                "Could not find any valid Title and Link pairs. "
+                "Make sure every link has a title on the line above it.",
+            )
             return
 
         if any(len(subs) >= 2 for subs in subtitles_list):
-            if messagebox.askyesno("Ignore Lines", "Would you like to ignore the first 2 lines of text between the videos? (e.g. Farsi descriptions)"):
-                try:
-                    titles_file_path = os.path.join(self.downloads_dir, "Titles.txt")
-                    with open(titles_file_path, 'a', encoding='utf-8') as tf:
-                        for i in range(len(subtitles_list)):
-                            if len(subtitles_list[i]) >= 2:
-                                # Store the ignored lines
-                                tf.write(f"--- {titles[i]} ---\n")
-                                tf.write(subtitles_list[i][0] + "\n")
-                                tf.write(subtitles_list[i][1] + "\n\n")
-                                
-                                # Remove them from the list
-                                subtitles_list[i] = subtitles_list[i][2:]
-                            else:
-                                subtitles_list[i] = []
-                    self.log(f"-> Saved ignored lines to Titles.txt")
-                except Exception as e:
-                    self.log(f"-> Warning: Could not save Titles.txt: {str(e)}")
+            if messagebox.askyesno(
+                "Ignore Lines",
+                "Would you like to ignore the first 2 lines of text between the videos? "
+                "(e.g. Farsi descriptions)",
+            ):
+                self._archive_ignored_lines(titles, subtitles_list)
 
-        self.downloading = True
-        self.cancelled = False
-        
-        self.download_btn.config_state('disabled', text="Downloading...", bg="#A1C6EA")
-        self.cancel_btn.config_state('normal', bg="#FF3B30")
-        self.browse_btn.config_state('disabled')
-        
-        # Clear log
-        self.log_text.config(state='normal')
+        with self._state_lock:
+            self.downloading = True
+            self.cancelled = False
+
+        self.download_btn.config_state("disabled", text="Downloading...", bg="#A1C6EA")
+        self.cancel_btn.config_state("normal", bg="#FF3B30")
+        self.browse_btn.config_state("disabled")
+
+        self.log_text.config(state="normal")
         self.log_text.delete("1.0", tk.END)
-        self.log_text.config(state='disabled')
+        self.log_text.config(state="disabled")
 
         self.log(f"Starting batch download for {len(titles)} items...")
-        
-        # Disable input
-        self.input_text.config(state='disabled', bg="#F5F5F7")
-        
-        # Start download thread
-        sync_mode = self.sync_mode_var.get()
-        threading.Thread(target=self.download_process, args=(titles, links, subtitles_list, sync_mode), daemon=True).start()
+        self.input_text.config(state="disabled", bg="#F5F5F7")
 
-    def download_process(self, titles, links, subtitles_list, sync_mode):
-        """
-        The core download logic running in a separate thread.
-        Iterates through the batch list, calls yt-dlp via subprocess,
-        and handles subtitle generation (standard or Whisper AI).
-        """
-        # Dynamic libraries for heavy AI operations (imported on demand to keep startup fast)
-        stable_whisper = None
-        _whisper = None
-        if sync_mode == "Whisper AI (Smart Sync)":
+        sync_mode = self.sync_mode_var.get()
+        threading.Thread(
+            target=self.download_process,
+            args=(titles, links, subtitles_list, sync_mode),
+            daemon=True,
+        ).start()
+
+    def _archive_ignored_lines(
+        self, titles: Sequence[str], subtitles_list: List[List[str]],
+    ) -> None:
+        try:
+            titles_file_path = self.downloads_dir / "Titles.txt"
+            with titles_file_path.open("a", encoding="utf-8") as tf:
+                for i in range(len(subtitles_list)):
+                    if len(subtitles_list[i]) >= 2:
+                        tf.write(f"--- {titles[i]} ---\n")
+                        tf.write(subtitles_list[i][0] + "\n")
+                        tf.write(subtitles_list[i][1] + "\n\n")
+                        subtitles_list[i] = subtitles_list[i][2:]
+                    else:
+                        subtitles_list[i] = []
+            self.log("-> Saved ignored lines to Titles.txt")
+        except OSError as e:
+            self.log(f"-> Warning: Could not save Titles.txt: {e}")
+
+    # ------------------------------------------------------------------
+    # Download orchestration (worker thread)
+    # ------------------------------------------------------------------
+    def _is_cancelled(self) -> bool:
+        with self._state_lock:
+            return self.cancelled
+
+    def _set_current_process(self, proc: Optional[subprocess.Popen]) -> None:
+        with self._state_lock:
+            self.current_process = proc
+
+    def _build_yt_dlp_command(self, title: str, link: str) -> List[str]:
+        safe_title = sanitize_filename(title)
+        output_path = str(self.downloads_dir / f"{safe_title}.%(ext)s")
+
+        yt_dlp_exe = BASE_PATH / "yt-dlp.exe"
+        exe_path = str(yt_dlp_exe) if yt_dlp_exe.exists() else "yt-dlp"
+
+        cmd: List[str] = [
+            exe_path,
+            "-o", output_path,
+            "--no-playlist",
+            # H.264 (avc1) + AAC (m4a) keeps Premiere Pro happy.
+            "-f",
+            "bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]"
+            "/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "--merge-output-format", "mp4",
+        ]
+
+        cookies_txt = BASE_PATH / "cookies.txt"
+        if cookies_txt.exists():
+            cmd.extend(["--cookies", str(cookies_txt)])
+        elif self.use_browser_cookies.get():
+            cmd.extend(["--cookies-from-browser", "chrome"])
+
+        deno_exe = BASE_PATH / "deno.exe"
+        if deno_exe.exists():
+            cmd.extend(["--js-runtime", "deno:" + str(deno_exe)])
+
+        ffmpeg_exe = BASE_PATH / "ffmpeg.exe"
+        if ffmpeg_exe.exists():
+            cmd.extend(["--ffmpeg-location", str(ffmpeg_exe)])
+
+        cmd.append(link)
+        return cmd
+
+    def _run_yt_dlp(self, cmd: List[str]) -> int:
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, creationflags=creationflags,
+        )
+        self._set_current_process(proc)
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                if self._is_cancelled():
+                    break
+                self.log("  " + line.strip())
             try:
-                import stable_whisper as sw
-                import whisper as w
-                import warnings
-                import torch
-                stable_whisper = sw
-                _whisper = w
-                warnings.filterwarnings("ignore")
-            except ImportError:
-                self.log("[!] Error: Whisper or Torch not found in environment. Falling back to standard sync.")
+                proc.wait(timeout=PROCESS_TERMINATE_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                self._terminate_process(proc)
+                proc.wait()
+            return proc.returncode if proc.returncode is not None else -1
+        finally:
+            self._set_current_process(None)
+
+    def download_process(
+        self,
+        titles: Sequence[str],
+        links: Sequence[str],
+        subtitles_list: Sequence[Sequence[str]],
+        sync_mode: str,
+    ) -> None:
+        aligner: Optional[WhisperAligner] = None
+        if sync_mode == "Whisper AI (Smart Sync)":
+            aligner = WhisperAligner.try_create(self.log)
+            if aligner is None:
                 sync_mode = "None (2-second intervals)"
 
         try:
-            # Save a text file with all titles and links
-            try:
-                batch_file_path = os.path.join(self.downloads_dir, "batch_links.txt")
-                with open(batch_file_path, 'w', encoding='utf-8') as bf:
-                    for title, link in zip(titles, links):
-                        bf.write(f"{title}\n{link}\n\n")
-                self.log(f"-> Saved batch_links.txt to {self.downloads_dir}")
-            except Exception as e:
-                self.log(f"-> Warning: Could not save batch_links.txt: {str(e)}")
-
-            errors_found = []
+            self._save_batch_links(titles, links)
+            errors_found: List[str] = []
 
             for i, (title, link, subs) in enumerate(zip(titles, links, subtitles_list), 1):
-                if self.cancelled:
+                if self._is_cancelled():
                     break
 
                 self.log(f"\n[{i}/{len(titles)}] Downloading: {title}")
                 self.log(f"URL: {link}")
-                
-                # Setup output template inside the dedicated Downloads folder
-                output_path = os.path.join(self.downloads_dir, f"{title}.%(ext)s")
-                final_video_path = os.path.join(self.downloads_dir, f"{title}.mp4")
-                
-                # Prefer local binaries if they exist
-                base_path = os.path.dirname(os.path.abspath(__file__))
-                yt_dlp_exe = os.path.join(base_path, "yt-dlp.exe")
-                exe_path = yt_dlp_exe if os.path.exists(yt_dlp_exe) else "yt-dlp"
 
-                cmd = [
-                    exe_path,
-                    "-o", output_path,
-                    "--no-playlist",
-                    # H.264 (avc1) + AAC (m4a) = best Premiere Pro compatibility
-                    "-f", "bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-                    "--merge-output-format", "mp4",
-                ]
-                
-                # 1. Handle Cookies
-                cookies_txt = os.path.join(base_path, "cookies.txt")
-                if os.path.exists(cookies_txt):
-                    cmd.extend(["--cookies", cookies_txt])
-                elif self.use_browser_cookies.get():
-                    # Fallback to browser cookies if enabled and no local file
-                    cmd.extend(["--cookies-from-browser", "chrome"])
-
-                # 2. Handle JS Runtime (Deno)
-                deno_exe = os.path.join(base_path, "deno.exe")
-                if os.path.exists(deno_exe):
-                    cmd.extend(["--js-runtime", "deno:" + deno_exe])
-
-                # If local ffmpeg exists, tell yt-dlp to use it
-                ffmpeg_exe = os.path.join(base_path, "ffmpeg.exe")
-                if os.path.exists(ffmpeg_exe):
-                    cmd.extend(["--ffmpeg-location", ffmpeg_exe])
-
-                cmd.append(link)
-                
-                if self.cancelled:
+                cmd = self._build_yt_dlp_command(title, link)
+                if self._is_cancelled():
                     break
 
-                creationflags = 0
-                if os.name == 'nt':
-                    creationflags = subprocess.CREATE_NO_WINDOW
-                
-                self.current_process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    creationflags=creationflags
-                )
-                
-                for line in self.current_process.stdout:
-                    if self.cancelled:
-                        break
-                    self.log("  " + line.strip())
-                    
-                self.current_process.wait()
-                return_code = self.current_process.returncode
-                self.current_process = None
+                return_code = self._run_yt_dlp(cmd)
 
-                if self.cancelled:
+                if self._is_cancelled():
                     break
-                
+
                 if return_code == 0:
                     self.log(f"-> Successfully downloaded: {title}")
-                    
-                    # Create SRT file after download since Whisper needs the video/audio file
-                    if subs:
-                        srt_path = os.path.join(self.downloads_dir, f"{title} (SRT).srt")
-                        whisper_success = False
-                        if sync_mode == "Whisper AI (Smart Sync)" and stable_whisper:
-                            if self.cancelled: break
-                            
-                            audio_source = self._get_dub_track(title)
-                            if audio_source:
-                                self.log(f"-> Starting Whisper Smart Sync... (This may take a minute)")
-                                try:
-                                    whisper_success = self.sync_with_whisper(
-                                        stable_whisper, _whisper, audio_source, subs, srt_path
-                                    )
-                                except Exception as e:
-                                    self.log(f"-> Error with Whisper Sync: {str(e)}")
-                                    errors_found.append(f"Whisper Error for '{title}': {str(e)}")
-                                    self.log("-> Falling back to 2-second timestamps...")
-                            else:
-                                self.log(f"-> No matching dub found in folder. Falling back to 2-second timestamps.")
-                        
-                        # Fallback Or Standard Option
-                        if not whisper_success and not self.cancelled:
-                            self.generate_standard_srt(subs, srt_path)
-
-                                
+                    self._maybe_generate_srt(title, subs, aligner, errors_found)
                 else:
                     self.log(f"-> Error downloading: {title} (Return code: {return_code})")
-                    errors_found.append(f"Download Error for '{title}': Process exited with code {return_code}")
-            
-            # Save errors to file if any
+                    errors_found.append(
+                        f"Download Error for '{title}': Process exited with code {return_code}"
+                    )
+
             if errors_found:
-                try:
-                    error_file_path = os.path.join(self.downloads_dir, "errors.txt")
-                    with open(error_file_path, 'w', encoding='utf-8') as ef:
-                        ef.write("--- Download Errors ---\n\n")
-                        for err in errors_found:
-                            ef.write(f"- {err}\n")
-                    self.log(f"-> Exported {len(errors_found)} errors to errors.txt")
-                except Exception as e:
-                    self.log(f"-> Warning: Could not save errors.txt: {str(e)}")
-                    
+                self._save_errors(errors_found)
+
         except Exception as e:
-            self.log(f"\nAn error occurred: {str(e)}")
-            
+            logger.exception("Batch download crashed")
+            self.log(f"\nAn error occurred: {e}")
         finally:
-            if self.cancelled:
-                self.log("\nBatch download cancelled by user.")
-            else:
-                self.log("\nBatch download complete.")
+            self.log(
+                "\nBatch download cancelled by user."
+                if self._is_cancelled()
+                else "\nBatch download complete."
+            )
             self.root.after(0, self.reset_ui)
-            
-    def _get_dub_track(self, title):
-        """Helper to find a matching audio file in the dub folder"""
-        if hasattr(self, 'dub_dir') and self.dub_dir:
-            possible_exts = ['.mp3', '.wav', '.m4a']
-            for ext in possible_exts:
-                dub_path = os.path.join(self.dub_dir, f"{title}{ext}")
-                if os.path.exists(dub_path):
-                    self.log(f"-> Found dub track: {title}{ext} - Syncing with Whisper AI!")
-                    return dub_path
+
+    def _save_batch_links(self, titles: Sequence[str], links: Sequence[str]) -> None:
+        try:
+            path = self.downloads_dir / "batch_links.txt"
+            with path.open("w", encoding="utf-8") as bf:
+                for title, link in zip(titles, links):
+                    bf.write(f"{title}\n{link}\n\n")
+            self.log(f"-> Saved batch_links.txt to {self.downloads_dir}")
+        except OSError as e:
+            self.log(f"-> Warning: Could not save batch_links.txt: {e}")
+
+    def _save_errors(self, errors_found: Sequence[str]) -> None:
+        try:
+            path = self.downloads_dir / "errors.txt"
+            with path.open("w", encoding="utf-8") as ef:
+                ef.write("--- Download Errors ---\n\n")
+                for err in errors_found:
+                    ef.write(f"- {err}\n")
+            self.log(f"-> Exported {len(errors_found)} errors to errors.txt")
+        except OSError as e:
+            self.log(f"-> Warning: Could not save errors.txt: {e}")
+
+    def _maybe_generate_srt(
+        self,
+        title: str,
+        subs: Sequence[str],
+        aligner: Optional[WhisperAligner],
+        errors_found: List[str],
+    ) -> None:
+        if not subs:
+            return
+
+        safe_title = sanitize_filename(title)
+        srt_path = self.downloads_dir / f"{safe_title} (SRT).srt"
+        whisper_success = False
+
+        if aligner is not None:
+            if self._is_cancelled():
+                return
+
+            audio_source = self._get_dub_track(title)
+            if audio_source:
+                self.log("-> Starting Whisper Smart Sync... (This may take a minute)")
+                try:
+                    whisper_success = aligner.align(
+                        audio_source, subs, srt_path, is_cancelled=self._is_cancelled,
+                    )
+                except Exception as e:
+                    logger.exception("Whisper sync failed for %s", title)
+                    self.log(f"-> Error with Whisper Sync: {e}")
+                    errors_found.append(f"Whisper Error for '{title}': {e}")
+                    self.log("-> Falling back to 2-second timestamps...")
+            else:
+                self.log("-> No matching dub found in folder. Falling back to 2-second timestamps.")
+
+        if not whisper_success and not self._is_cancelled():
+            generate_standard_srt(subs, srt_path, self.log)
+
+    def _get_dub_track(self, title: str) -> Optional[str]:
+        if not self.dub_dir:
+            return None
+        dub_dir = Path(self.dub_dir)
+        for ext in (".mp3", ".wav", ".m4a"):
+            candidate = dub_dir / f"{title}{ext}"
+            if candidate.exists():
+                self.log(f"-> Found dub track: {candidate.name} - Syncing with Whisper AI!")
+                return str(candidate)
         return None
 
-    def sync_with_whisper(self, stable_whisper, _whisper, audio_source, subs, srt_path):
-        """
-        Orchestrates Whisper AI alignment and custom SRT fanning for unaligned text.
-        
-        This method uses stable-whisper to align text to audio. If text extends past 
-        the audio (e.g. original video voice after a dub ends), it automatically 
-        fans out the remaining subtitles into sequential 2-second intervals.
-        """
-        if self.cancelled: return False
-        
-        # Load model
-        model = stable_whisper.load_model('base')
-        
-        if self.cancelled: return False
-        # Manual language detection
-        self.log("-> Analyzing audio for language detection...")
-        audio = _whisper.load_audio(audio_source)
-        audio_duration = audio.shape[0] / 16000.0
-        
-        trimmed_audio = _whisper.pad_or_trim(audio)
-        mel = _whisper.log_mel_spectrogram(trimmed_audio).to(model.device)
-        _, probs = model.detect_language(mel)
-        detected_lang = max(probs, key=probs.get)
-        self.log(f"-> Detected language: '{detected_lang}'")
+    # ------------------------------------------------------------------
+    # UI reset
+    # ------------------------------------------------------------------
+    def reset_ui(self) -> None:
+        with self._state_lock:
+            self.downloading = False
+        self.download_btn.config_state("normal", text="Start Download", bg=self.accent_color)
+        self.cancel_btn.config_state("disabled", bg="#E5E5EA")
+        self.browse_btn.config_state("normal", bg=self.gray_bg)
+        self.input_text.config(state="normal", bg="white")
 
-        valid_subs = [line for line in subs if line.strip()]
-        text_to_align = "\n".join(valid_subs)
-        
-        if self.cancelled: return False
-        self.log(f"-> Syncing {len(valid_subs)} lines...")
-        result = model.align(audio_source, text_to_align, detected_lang)
-        
-        # Map words back to original lines to handle trailing text
-        all_words = []
-        for s in result.segments:
-            all_words.extend(getattr(s, 'words', []))
-            
-        line_word_mapping = []
-        word_idx = 0
-        for line in valid_subs:
-            line_clean = line.replace(" ", "").replace("\n", "")
-            chars_matched = 0
-            words_for_line = []
-            while chars_matched < len(line_clean) and word_idx < len(all_words):
-                w = all_words[word_idx]
-                w_clean = w.word.replace(" ", "")
-                chars_matched += len(w_clean)
-                words_for_line.append(w)
-                word_idx += 1
-            line_word_mapping.append(words_for_line)
-            
-        with open(srt_path, 'w', encoding='utf-8') as f:
-            current_unaligned_time = None
-            
-            for i, (line_text, words_in_line) in enumerate(zip(valid_subs, line_word_mapping), 1):
-                if not words_in_line:
-                    continue
-                    
-                is_unaligned = all((w.start == w.end or w.start >= audio_duration - 0.5) for w in words_in_line)
-                if current_unaligned_time is not None:
-                    is_unaligned = True
-                    
-                if is_unaligned:
-                    if current_unaligned_time is None:
-                        last_end = 0
-                        for prev_line_words in line_word_mapping[:i-1]:
-                            for pw in prev_line_words:
-                                if pw.start != pw.end and pw.end < audio_duration - 0.5:
-                                    last_end = max(last_end, pw.end)
-                        current_unaligned_time = last_end if last_end > 0 else audio_duration
-                        
-                    start_time = current_unaligned_time
-                    end_time = start_time + 2.0
-                    current_unaligned_time = end_time
-                else:
-                    start_time = words_in_line[0].start
-                    end_time = words_in_line[-1].end
-                    if start_time >= end_time:
-                        end_time = start_time + 2.0
-                        
-                f.write(f"{i}\n")
-                f.write(f"{self.format_time(start_time)} --> {self.format_time(end_time)}\n")
-                f.write(f"{line_text}\n\n")
-        
-        self.log(f"-> Whisper Sync successful! SRT saved.")
-        return True
 
-    def generate_standard_srt(self, subs, srt_path):
-        """Generates a simple SRT file with 2-second intervals"""
-        try:
-            with open(srt_path, 'w', encoding='utf-8') as f:
-                current_time = 0
-                for j, sub_line in enumerate(subs, 1):
-                    f.write(f"{j}\n")
-                    start_time_str = self.format_time(current_time)
-                    current_time += 2
-                    end_time_str = self.format_time(current_time)
-                    f.write(f"{start_time_str} --> {end_time_str}\n")
-                    f.write(f"{sub_line}\n\n")
-            self.log(f"-> Created standard SRT file with {len(subs)} lines (2s intervals).")
-            return True
-        except Exception as e:
-            self.log(f"-> Error creating SRT: {str(e)}")
-            return False
+def _enable_dpi_awareness() -> None:
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except (AttributeError, OSError) as e:
+        logger.debug("Could not enable DPI awareness: %s", e)
 
-    def reset_ui(self):
-        self.downloading = False
-        self.download_btn.config_state('normal', text="Start Download", bg=self.accent_color)
-        self.cancel_btn.config_state('disabled', bg="#E5E5EA")
-        self.browse_btn.config_state('normal', bg=self.gray_bg)
-        self.input_text.config(state='normal', bg="white")
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    _enable_dpi_awareness()
+    root = tk.Tk()
+    AppleStyleApp(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":
-    import ctypes
-    # Make DPI aware (Windows) to avoid blurry text
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    except:
-        pass
-        
-    root = tk.Tk()
-    app = AppleStyleApp(root)
-    root.mainloop()
+    main()

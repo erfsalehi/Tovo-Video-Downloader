@@ -6,6 +6,7 @@ __pycache__/
 
 # Local configuration
 config.json
+config.json.tmp
 cookies.txt
 
 # Large binaries
