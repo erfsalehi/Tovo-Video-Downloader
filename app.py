@@ -62,6 +62,8 @@ class AppleStyleApp:
         self.downloading = False
         self.cancelled = False
         self.active_processes: Dict[int, subprocess.Popen] = {}
+        self.batch_errors: List[str] = []
+        self.errors_lock = threading.Lock()
 
         self.root.configure(bg=self.bg_color)
         self._build_ui()
@@ -464,13 +466,13 @@ class AppleStyleApp:
             aligner: Optional[WhisperAligner] = None
             if sync_mode == "Whisper AI (Smart Sync)":
                 aligner = WhisperAligner.try_create(self.log)
-            errors_found: List[str] = []
-            error_lock = threading.Lock()
+            
             success = self._download_item_worker(
-                index, title, link, subs, aligner, errors_found, error_lock, is_retry=True
+                index, title, link, subs, aligner, is_retry=True
             )
-            if not success and errors_found:
-                self._save_errors(errors_found)
+            with self.errors_lock:
+                if not success and self.batch_errors:
+                    self._save_errors(self.batch_errors)
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -542,6 +544,16 @@ class AppleStyleApp:
         sync_mode = self.sync_mode_var.get()
         self.cancelled_indices = set()
         self.skipped_indices = set()
+        
+        with self.errors_lock:
+            self.batch_errors = []
+        # Clear the errors file at start
+        errors_txt = self.downloads_dir / "errors.txt"
+        if errors_txt.exists():
+            try:
+                errors_txt.unlink()
+            except OSError:
+                pass
         
         # Store items so manual retry can access them after the batch finishes
         self._download_items = list(zip(titles, links, subtitles_list))
@@ -676,8 +688,6 @@ class AppleStyleApp:
         link: str,
         subs: Sequence[str],
         aligner: Optional[WhisperAligner],
-        errors_found: List[str],
-        error_lock: threading.Lock,
         is_retry: bool = False,
     ) -> bool:
         """Worker function for a single item download. Returns True if successful."""
@@ -713,7 +723,7 @@ class AppleStyleApp:
             self.log(f"-> Successfully downloaded: {title}")
             if self.download_manager:
                 self.root.after(0, self.download_manager.set_item_status, index, "Finished", "#34C759")
-            self._maybe_generate_srt(title, subs, aligner, errors_found, error_lock)
+            self._maybe_generate_srt(title, subs, aligner)
             return True
         else:
             self.log(f"-> Error downloading: {title} (Return code: {return_code})")
@@ -724,8 +734,8 @@ class AppleStyleApp:
                 if self.download_manager:
                     self.root.after(0, self.download_manager.set_item_status, index, "Failed", "#FF3B30")
             
-            with error_lock:
-                errors_found.append(f"Download Error for '{title}': Process exited with code {return_code}")
+            with self.errors_lock:
+                self.batch_errors.append(f"Download Error for '{title}': Process exited with code {return_code}")
             return False
 
     def download_process(
@@ -759,7 +769,7 @@ class AppleStyleApp:
                 futures = {}
                 for i, title, link, subs in items:
                     futures[executor.submit(
-                        self._download_item_worker, i, title, link, subs, aligner, errors_found, error_lock
+                        self._download_item_worker, i, title, link, subs, aligner
                     )] = i
                 
                 for future, item_index in futures.items():
@@ -778,7 +788,7 @@ class AppleStyleApp:
                     retry_futures = {}
                     for i, title, link, subs in failed_items:
                         retry_futures[executor.submit(
-                            self._download_item_worker, i, title, link, subs, aligner, errors_found, error_lock, is_retry=True
+                            self._download_item_worker, i, title, link, subs, aligner, is_retry=True
                         )] = (i, title, link, subs)
                     for future, item_tuple in retry_futures.items():
                         success = future.result()
@@ -787,23 +797,35 @@ class AppleStyleApp:
                             still_failing.append(item_tuple)
                 failed_items = still_failing
 
-            if errors_found:
-                self._save_errors(errors_found)
+            with self.errors_lock:
+                if self.batch_errors:
+                    self._save_errors(self.batch_errors)
 
         except Exception as e:
             logger.exception("Batch download crashed")
             self.log(f"\nAn error occurred: {e}")
         finally:
-            self.log(
-                "\nBatch download cancelled by user."
-                if self._is_cancelled()
-                else "\nBatch download complete."
-            )
+            has_failures = False
             if self.download_manager:
-                self.root.after(0, self.download_manager.destroy)
-                self.download_manager = None
-            self.input_frame.grid()
-            self.root.after(0, self.reset_ui)
+                for item in self.download_manager.items:
+                    if item.status_label["text"] == "Failed":
+                        has_failures = True
+                        break
+
+            if has_failures and not self._is_cancelled():
+                self.log("\nBatch finished with errors. You can manually Retry or Skip items now.")
+                self.root.after(0, lambda: self.download_btn.config_state("normal", text="Finish & Return", bg="#34C759"))
+            else:
+                self.log(
+                    "\nBatch download cancelled by user."
+                    if self._is_cancelled()
+                    else "\nBatch download complete."
+                )
+                if self.download_manager:
+                    self.root.after(0, self.download_manager.destroy)
+                    self.download_manager = None
+                self.input_frame.grid()
+                self.root.after(0, self.reset_ui)
 
     def _save_batch_links(self, titles: Sequence[str], links: Sequence[str]) -> None:
         try:
@@ -831,8 +853,6 @@ class AppleStyleApp:
         title: str,
         subs: Sequence[str],
         aligner: Optional[WhisperAligner],
-        errors_found: List[str],
-        error_lock: Optional[threading.Lock] = None,
     ) -> None:
         if not subs:
             return
@@ -856,11 +876,8 @@ class AppleStyleApp:
                     logger.exception("Whisper sync failed for %s", title)
                     self.log(f"-> Error with Whisper Sync: {e}")
                     err_msg = f"Whisper Error for '{title}': {e}"
-                    if error_lock:
-                        with error_lock:
-                            errors_found.append(err_msg)
-                    else:
-                        errors_found.append(err_msg)
+                    with self.errors_lock:
+                        self.batch_errors.append(err_msg)
                     self.log("-> Falling back to 2-second timestamps...")
             else:
                 self.log("-> No matching dub found in folder. Falling back to 2-second timestamps.")
