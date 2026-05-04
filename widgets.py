@@ -165,14 +165,28 @@ class DownloadItem(tk.Frame):
         self.retry_btn.grid(row=0, column=5, sticky="e", padx=(4, 0))
         self.retry_btn.grid_remove()  # hidden by default
 
+        # Skip button — lets user dismiss a permanently broken item
+        self.skip_btn = tk.Button(
+            self, text="✓ Skip", font=(font_family, 7, "bold"),
+            bg="white", fg="#34C759",
+            relief=tk.FLAT, bd=0, cursor="hand2",
+            activebackground="white", activeforeground="#248A3D",
+        )
+        self.skip_btn.grid(row=0, column=6, sticky="e", padx=(4, 0))
+        self.skip_btn.grid_remove()  # hidden by default
+
     def set_on_retry(self, callback: Callable[[], None]) -> None:
         """Attach the retry callback (called after construction by DownloadManager)."""
         self.retry_btn.config(command=callback)
 
+    def set_on_skip(self, callback: Callable[[], None]) -> None:
+        """Attach the skip callback (called after construction by DownloadManager)."""
+        self.skip_btn.config(command=callback)
+
     def update_progress(self, percent: float) -> None:
         self.progress_var.set(percent)
         self.percent_label.config(text=f"{int(percent)}%")
-        if self.status_label["text"] not in ("Finished", "Failed", "Cancelled"):
+        if self.status_label["text"] not in ("Finished", "Failed", "Cancelled", "Skipped"):
             self.status_label.config(text="Active", fg=self.accent_color)
 
     def set_status(self, status: str, color: Optional[str] = None) -> None:
@@ -183,16 +197,19 @@ class DownloadItem(tk.Frame):
         if status == "Failed":
             self.cancel_btn.grid_remove()
             self.retry_btn.grid()
+            self.skip_btn.grid()
         elif status in ("Active", "Retrying...", "Waiting"):
             self.retry_btn.grid_remove()
+            self.skip_btn.grid_remove()
             self.cancel_btn.grid()
             # Reset progress bar when retrying
             if status == "Retrying...":
                 self.progress_var.set(0)
                 self.percent_label.config(text="0%")
-        elif status in ("Finished", "Cancelled"):
+        elif status in ("Finished", "Cancelled", "Skipped"):
             self.cancel_btn.grid_remove()
             self.retry_btn.grid_remove()
+            self.skip_btn.grid_remove()
             if status == "Finished":
                 self.progress_var.set(100)
                 self.percent_label.config(text="100%")
@@ -207,6 +224,7 @@ class DownloadManager(tk.Frame):
         titles: List[str],
         on_cancel_item: Callable[[int], None],
         on_retry_item: Callable[[int], None],
+        on_skip_item: Callable[[int], None],
         bg_color: str,
         text_color: str,
         accent_color: str,
@@ -240,6 +258,7 @@ class DownloadManager(tk.Frame):
                 bg_color, text_color, accent_color, font_family
             )
             item.set_on_retry(lambda idx=i: on_retry_item(idx))
+            item.set_on_skip(lambda idx=i: on_skip_item(idx))
             item.pack(fill=tk.X)
             self.items.append(item)
 

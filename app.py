@@ -474,6 +474,14 @@ class AppleStyleApp:
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _skip_item(self, index: int) -> None:
+        """Mark an item as skipped/done manually."""
+        with self._state_lock:
+            self.skipped_indices.add(index)
+            if self.download_manager:
+                self.download_manager.set_item_status(index, "Skipped", "#34C759")
+            self.log(f"-> Item marked as skipped: {index + 1}")
+
     def start_download(self) -> None:
         with self._state_lock:
             if self.downloading:
@@ -533,6 +541,7 @@ class AppleStyleApp:
 
         sync_mode = self.sync_mode_var.get()
         self.cancelled_indices = set()
+        self.skipped_indices = set()
         
         # Store items so manual retry can access them after the batch finishes
         self._download_items = list(zip(titles, links, subtitles_list))
@@ -543,6 +552,7 @@ class AppleStyleApp:
             self.main_frame, titles,
             self._cancel_single_item,
             self._manual_retry_item,
+            self._skip_item,
             self.bg_color, self.text_color, self.accent_color, self.font_family
         )
         self.download_manager.grid(row=2, column=0, sticky="nsew", pady=(0, 15))
@@ -754,7 +764,7 @@ class AppleStyleApp:
                 
                 for future, item_index in futures.items():
                     success = future.result()
-                    if not success and not self._is_cancelled() and item_index not in self.cancelled_indices:
+                    if not success and not self._is_cancelled() and item_index not in self.cancelled_indices and item_index not in self.skipped_indices:
                         failed_items.append(items[item_index])
 
             # Phases 2-6: Retry failed items up to 5 times total
@@ -773,7 +783,7 @@ class AppleStyleApp:
                     for future, item_tuple in retry_futures.items():
                         success = future.result()
                         i = item_tuple[0]
-                        if not success and not self._is_cancelled() and i not in self.cancelled_indices:
+                        if not success and not self._is_cancelled() and i not in self.cancelled_indices and i not in self.skipped_indices:
                             still_failing.append(item_tuple)
                 failed_items = still_failing
 
