@@ -13,6 +13,8 @@ DEFAULTS: dict[str, Any] = {
     "downloads_dir": "",
     "dub_dir": "",
     "use_browser_cookies": False,
+    "concurrent_downloads": False,
+    "max_concurrent": 5,
 }
 
 

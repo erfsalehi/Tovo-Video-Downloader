@@ -9,7 +9,8 @@ import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Set
+from concurrent.futures import ThreadPoolExecutor
 
 from config import Config
 from dependencies import find_missing_tools, install_all
@@ -60,7 +61,7 @@ class AppleStyleApp:
         self._state_lock = threading.Lock()
         self.downloading = False
         self.cancelled = False
-        self.current_process: Optional[subprocess.Popen] = None
+        self.active_processes: Dict[int, subprocess.Popen] = {}
 
         self.root.configure(bg=self.bg_color)
         self._build_ui()
@@ -185,12 +186,28 @@ class AppleStyleApp:
             font=(self.font_family, 11, "bold"),
         ).pack(side=tk.LEFT, padx=(0, 10))
 
-        self.sync_mode_var = tk.StringVar(value="None (2-second intervals)")
         ttk.Combobox(
             frame, textvariable=self.sync_mode_var,
             values=["None (2-second intervals)", "Whisper AI (Smart Sync)"],
-            state="readonly", font=(self.font_family, 10),
+            state="readonly", font=(self.font_family, 10), width=25,
         ).pack(side=tk.LEFT)
+
+        tk.Frame(frame, bg=self.bg_color, width=20).pack(side=tk.LEFT)
+
+        self.concurrent_var = tk.BooleanVar(value=self.config.get("concurrent_downloads", False))
+        tk.Checkbutton(
+            frame, text="Simultaneous",
+            variable=self.concurrent_var, bg=self.bg_color, activebackground=self.bg_color,
+            fg=self.text_color, font=(self.font_family, 10),
+            command=self._save_config,
+        ).pack(side=tk.LEFT)
+
+        self.max_concurrent_var = tk.IntVar(value=self.config.get("max_concurrent", 5))
+        self.max_concurrent_spin = tk.Spinbox(
+            frame, from_=1, to=10, textvariable=self.max_concurrent_var,
+            width=3, font=(self.font_family, 10), command=self._save_config,
+        )
+        self.max_concurrent_spin.pack(side=tk.LEFT, padx=(5, 0))
 
     def _build_dub_row(self) -> None:
         frame = tk.Frame(self.main_frame, bg=self.bg_color)
@@ -279,6 +296,8 @@ class AppleStyleApp:
         self.config.set("downloads_dir", str(self.downloads_dir))
         self.config.set("dub_dir", self.dub_dir)
         self.config.set("use_browser_cookies", self.use_browser_cookies.get())
+        self.config.set("concurrent_downloads", self.concurrent_var.get())
+        self.config.set("max_concurrent", self.max_concurrent_var.get())
         self.config.save()
 
     def browse_directory(self) -> None:
@@ -369,10 +388,10 @@ class AppleStyleApp:
             if not self.downloading or self.cancelled:
                 return
             self.cancelled = True
-            proc = self.current_process
+            procs = list(self.active_processes.values())
 
-        self.log("\n[!] Cancellation requested. Stopping process...")
-        if proc is not None:
+        self.log("\n[!] Cancellation requested. Stopping all processes...")
+        for proc in procs:
             self._terminate_process(proc)
         self.root.after(0, self.reset_ui)
 
@@ -427,13 +446,9 @@ class AppleStyleApp:
             if self.download_manager:
                 self.download_manager.set_item_status(index, "Cancelled", "#86868B")
             
-            # If the currently downloading item is cancelled, kill its process
-            # We'll need to know which index is currently downloading.
-            # I'll add self.current_index for this.
-            if getattr(self, "current_index", -1) == index:
-                proc = self.current_process
-                if proc:
-                    self._terminate_process(proc)
+            proc = self.active_processes.get(index)
+            if proc:
+                self._terminate_process(proc)
 
     def start_download(self) -> None:
         with self._state_lock:
@@ -532,9 +547,13 @@ class AppleStyleApp:
         with self._state_lock:
             return self.cancelled
 
-    def _set_current_process(self, proc: Optional[subprocess.Popen]) -> None:
+    def _add_active_process(self, index: int, proc: subprocess.Popen) -> None:
         with self._state_lock:
-            self.current_process = proc
+            self.active_processes[index] = proc
+
+    def _remove_active_process(self, index: int) -> None:
+        with self._state_lock:
+            self.active_processes.pop(index, None)
 
     def _build_yt_dlp_command(self, title: str, link: str) -> List[str]:
         safe_title = sanitize_filename(title)
@@ -571,13 +590,15 @@ class AppleStyleApp:
         cmd.append(link)
         return cmd
 
-    def _run_yt_dlp(self, cmd: List[str], progress_callback: Optional[Callable[[float], None]] = None) -> int:
+    def _run_yt_dlp(
+        self, index: int, cmd: List[str], progress_callback: Optional[Callable[[float], None]] = None
+    ) -> int:
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, creationflags=creationflags,
         )
-        self._set_current_process(proc)
+        self._add_active_process(index, proc)
         
         # Regex for yt-dlp progress: [download]  10.0% of ...
         progress_re = re.compile(r"\[download\]\s+(\d+\.\d+)%")
@@ -607,7 +628,66 @@ class AppleStyleApp:
                 proc.wait()
             return proc.returncode if proc.returncode is not None else -1
         finally:
-            self._set_current_process(None)
+            self._remove_active_process(index)
+
+    def _download_item_worker(
+        self,
+        index: int,
+        title: str,
+        link: str,
+        subs: Sequence[str],
+        aligner: Optional[WhisperAligner],
+        errors_found: List[str],
+        error_lock: threading.Lock,
+        is_retry: bool = False,
+    ) -> bool:
+        """Worker function for a single item download. Returns True if successful."""
+        if self._is_cancelled() or index in self.cancelled_indices:
+            return False
+
+        label = f" (Retry)" if is_retry else ""
+        self.log(f"\n[{index+1}] Starting: {title}{label}")
+        self.log(f"URL: {link}")
+
+        if self.download_manager:
+            status = "Retrying..." if is_retry else "Active"
+            self.root.after(0, self.download_manager.set_item_status, index, status, self.accent_color)
+
+        cmd = self._build_yt_dlp_command(title, link)
+        if self._is_cancelled() or index in self.cancelled_indices:
+            return False
+
+        def update_ui(p: float):
+            if self.download_manager:
+                self.root.after(0, self.download_manager.update_item_progress, index, p)
+
+        return_code = self._run_yt_dlp(index, cmd, progress_callback=update_ui)
+
+        if self._is_cancelled():
+            return False
+        
+        if index in self.cancelled_indices:
+            self.log(f"-> Item cancelled: {title}")
+            return False
+
+        if return_code == 0:
+            self.log(f"-> Successfully downloaded: {title}")
+            if self.download_manager:
+                self.root.after(0, self.download_manager.set_item_status, index, "Finished", "#34C759")
+            self._maybe_generate_srt(title, subs, aligner, errors_found)
+            return True
+        else:
+            self.log(f"-> Error downloading: {title} (Return code: {return_code})")
+            if not is_retry:
+                if self.download_manager:
+                    self.root.after(0, self.download_manager.set_item_status, index, "Failed (Queued for Retry)", "#FF9500")
+            else:
+                if self.download_manager:
+                    self.root.after(0, self.download_manager.set_item_status, index, "Failed", "#FF3B30")
+            
+            with error_lock:
+                errors_found.append(f"Download Error for '{title}': Process exited with code {return_code}")
+            return False
 
     def download_process(
         self,
@@ -625,46 +705,42 @@ class AppleStyleApp:
         try:
             self._save_batch_links(titles, links)
             errors_found: List[str] = []
+            error_lock = threading.Lock()
+            
+            concurrent_mode = self.concurrent_var.get()
+            max_workers = self.max_concurrent_var.get() if concurrent_mode else 1
+            
+            items = list(zip(range(len(titles)), titles, links, subtitles_list))
+            failed_items = []
 
-            for i, (title, link, subs) in enumerate(zip(titles, links, subtitles_list)):
-                self.current_index = i
-                if self._is_cancelled() or i in self.cancelled_indices:
-                    if i in self.cancelled_indices:
-                        self.log(f"\n[{i+1}/{len(titles)}] Skipping (Cancelled): {title}")
-                    continue
-
-                self.log(f"\n[{i+1}/{len(titles)}] Downloading: {title}")
-                self.log(f"URL: {link}")
-
-                cmd = self._build_yt_dlp_command(title, link)
-                if self._is_cancelled() or i in self.cancelled_indices:
-                    continue
-
-                def update_ui(p: float):
-                    if self.download_manager:
-                        self.root.after(0, self.download_manager.update_item_progress, i, p)
-
-                return_code = self._run_yt_dlp(cmd, progress_callback=update_ui)
-
-                if self._is_cancelled():
-                    break
+            # Phase 1: Initial Download
+            self.log(f"Starting downloads (Mode: {'Concurrent' if concurrent_mode else 'Sequential'}, Workers: {max_workers})...")
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = []
+                for i, title, link, subs in items:
+                    futures.append(executor.submit(
+                        self._download_item_worker, i, title, link, subs, aligner, errors_found, error_lock
+                    ))
                 
-                if i in self.cancelled_indices:
-                    self.log(f"-> Item cancelled: {title}")
-                    continue
+                for idx, future in enumerate(futures):
+                    success = future.result()
+                    if not success and not self._is_cancelled() and idx not in self.cancelled_indices:
+                        failed_items.append(items[idx])
 
-                if return_code == 0:
-                    self.log(f"-> Successfully downloaded: {title}")
-                    if self.download_manager:
-                        self.root.after(0, self.download_manager.set_item_status, i, "Finished", "#34C759")
-                    self._maybe_generate_srt(title, subs, aligner, errors_found)
-                else:
-                    self.log(f"-> Error downloading: {title} (Return code: {return_code})")
-                    if self.download_manager:
-                        self.root.after(0, self.download_manager.set_item_status, i, "Failed", "#FF3B30")
-                    errors_found.append(
-                        f"Download Error for '{title}': Process exited with code {return_code}"
-                    )
+            # Phase 2: Retry Failed Items
+            if failed_items and not self._is_cancelled():
+                self.log(f"\n--- Retrying {len(failed_items)} failed downloads ---")
+                # We retry them sequentially or concurrently? 
+                # User said "at the end of download give it another try", let's do them concurrently too but maybe with fewer workers or just same.
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    retry_futures = []
+                    for i, title, link, subs in failed_items:
+                        retry_futures.append(executor.submit(
+                            self._download_item_worker, i, title, link, subs, aligner, errors_found, error_lock, is_retry=True
+                        ))
+                    for future in retry_futures:
+                        future.result()
 
             if errors_found:
                 self._save_errors(errors_found)
