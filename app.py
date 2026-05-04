@@ -451,6 +451,29 @@ class AppleStyleApp:
             if proc:
                 self._terminate_process(proc)
 
+    def _manual_retry_item(self, index: int) -> None:
+        """Manually retry a single failed item from the UI button."""
+        if not hasattr(self, "_download_items") or index >= len(self._download_items):
+            return
+        # Remove from cancelled set in case it was cancelled before
+        self.cancelled_indices.discard(index)
+        title, link, subs = self._download_items[index]
+        sync_mode = self.sync_mode_var.get()
+
+        def _worker():
+            aligner: Optional[WhisperAligner] = None
+            if sync_mode == "Whisper AI (Smart Sync)":
+                aligner = WhisperAligner.try_create(self.log)
+            errors_found: List[str] = []
+            error_lock = threading.Lock()
+            success = self._download_item_worker(
+                index, title, link, subs, aligner, errors_found, error_lock, is_retry=True
+            )
+            if not success and errors_found:
+                self._save_errors(errors_found)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def start_download(self) -> None:
         with self._state_lock:
             if self.downloading:
@@ -511,10 +534,15 @@ class AppleStyleApp:
         sync_mode = self.sync_mode_var.get()
         self.cancelled_indices = set()
         
+        # Store items so manual retry can access them after the batch finishes
+        self._download_items = list(zip(titles, links, subtitles_list))
+
         # Hide input, show manager
         self.input_frame.grid_remove()
         self.download_manager = DownloadManager(
-            self.main_frame, titles, self._cancel_single_item,
+            self.main_frame, titles,
+            self._cancel_single_item,
+            self._manual_retry_item,
             self.bg_color, self.text_color, self.accent_color, self.font_family
         )
         self.download_manager.grid(row=2, column=0, sticky="nsew", pady=(0, 15))
@@ -729,19 +757,25 @@ class AppleStyleApp:
                     if not success and not self._is_cancelled() and item_index not in self.cancelled_indices:
                         failed_items.append(items[item_index])
 
-            # Phase 2: Retry Failed Items
-            if failed_items and not self._is_cancelled():
-                self.log(f"\n--- Retrying {len(failed_items)} failed downloads ---")
-                # We retry them sequentially or concurrently? 
-                # User said "at the end of download give it another try", let's do them concurrently too but maybe with fewer workers or just same.
+            # Phases 2-6: Retry failed items up to 5 times total
+            MAX_AUTO_RETRIES = 5
+            for attempt in range(1, MAX_AUTO_RETRIES + 1):
+                if not failed_items or self._is_cancelled():
+                    break
+                self.log(f"\n--- Retry attempt {attempt}/{MAX_AUTO_RETRIES} for {len(failed_items)} item(s) ---")
+                still_failing = []
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    retry_futures = []
+                    retry_futures = {}
                     for i, title, link, subs in failed_items:
-                        retry_futures.append(executor.submit(
+                        retry_futures[executor.submit(
                             self._download_item_worker, i, title, link, subs, aligner, errors_found, error_lock, is_retry=True
-                        ))
-                    for future in retry_futures:
-                        future.result()
+                        )] = (i, title, link, subs)
+                    for future, item_tuple in retry_futures.items():
+                        success = future.result()
+                        i = item_tuple[0]
+                        if not success and not self._is_cancelled() and i not in self.cancelled_indices:
+                            still_failing.append(item_tuple)
+                failed_items = still_failing
 
             if errors_found:
                 self._save_errors(errors_found)

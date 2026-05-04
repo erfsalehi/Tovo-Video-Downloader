@@ -155,6 +155,20 @@ class DownloadItem(tk.Frame):
         )
         self.cancel_btn.grid(row=0, column=4, sticky="e")
 
+        # Retry button — hidden until the item fails
+        self.retry_btn = tk.Button(
+            self, text="↻ Retry", font=(font_family, 7, "bold"),
+            bg="white", fg="#FF9500",
+            relief=tk.FLAT, bd=0, cursor="hand2",
+            activebackground="white", activeforeground="#CC7A00",
+        )
+        self.retry_btn.grid(row=0, column=5, sticky="e", padx=(4, 0))
+        self.retry_btn.grid_remove()  # hidden by default
+
+    def set_on_retry(self, callback: Callable[[], None]) -> None:
+        """Attach the retry callback (called after construction by DownloadManager)."""
+        self.retry_btn.config(command=callback)
+
     def update_progress(self, percent: float) -> None:
         self.progress_var.set(percent)
         self.percent_label.config(text=f"{int(percent)}%")
@@ -165,8 +179,20 @@ class DownloadItem(tk.Frame):
         self.status_label.config(text=status)
         if color:
             self.status_label.config(fg=color)
-        if status in ("Finished", "Failed", "Cancelled"):
+
+        if status == "Failed":
             self.cancel_btn.grid_remove()
+            self.retry_btn.grid()
+        elif status in ("Active", "Retrying...", "Waiting"):
+            self.retry_btn.grid_remove()
+            self.cancel_btn.grid()
+            # Reset progress bar when retrying
+            if status == "Retrying...":
+                self.progress_var.set(0)
+                self.percent_label.config(text="0%")
+        elif status in ("Finished", "Cancelled"):
+            self.cancel_btn.grid_remove()
+            self.retry_btn.grid_remove()
             if status == "Finished":
                 self.progress_var.set(100)
                 self.percent_label.config(text="100%")
@@ -180,6 +206,7 @@ class DownloadManager(tk.Frame):
         parent: tk.Misc,
         titles: List[str],
         on_cancel_item: Callable[[int], None],
+        on_retry_item: Callable[[int], None],
         bg_color: str,
         text_color: str,
         accent_color: str,
@@ -212,6 +239,7 @@ class DownloadManager(tk.Frame):
                 self.scrollable_frame, title, lambda idx=i: on_cancel_item(idx),
                 bg_color, text_color, accent_color, font_family
             )
+            item.set_on_retry(lambda idx=i: on_retry_item(idx))
             item.pack(fill=tk.X)
             self.items.append(item)
 
@@ -222,5 +250,3 @@ class DownloadManager(tk.Frame):
     def set_item_status(self, index: int, status: str, color: Optional[str] = None) -> None:
         if 0 <= index < len(self.items):
             self.items[index].set_status(status, color)
-
-
