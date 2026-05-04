@@ -67,7 +67,7 @@ def find_missing_tools(base_path: Path) -> List[str]:
 
 def _download_yt_dlp(base_path: Path, log: LogFn) -> None:
     target = base_path / "yt-dlp.exe"
-    if target.exists():
+    if target.exists() or shutil.which("yt-dlp"):
         return
     log("-> Downloading yt-dlp.exe...")
     for attempt in range(3):
@@ -85,7 +85,7 @@ def _download_yt_dlp(base_path: Path, log: LogFn) -> None:
 
 def _download_ffmpeg(base_path: Path, log: LogFn) -> None:
     target = base_path / "ffmpeg.exe"
-    if target.exists():
+    if target.exists() or shutil.which("ffmpeg"):
         return
     log("-> Downloading FFmpeg (this may take a moment)...")
     temp_zip = base_path / "ffmpeg.zip"
@@ -113,7 +113,7 @@ def _download_ffmpeg(base_path: Path, log: LogFn) -> None:
 
 def _download_deno(base_path: Path, log: LogFn) -> None:
     target = base_path / "deno.exe"
-    if target.exists():
+    if target.exists() or shutil.which("deno"):
         return
     log("-> Downloading Deno (JS runtime for YouTube extraction)...")
     temp_zip = base_path / "deno.zip"
