@@ -186,6 +186,7 @@ class AppleStyleApp:
             font=(self.font_family, 11, "bold"),
         ).pack(side=tk.LEFT, padx=(0, 10))
 
+        self.sync_mode_var = tk.StringVar(value="None (2-second intervals)")
         ttk.Combobox(
             frame, textvariable=self.sync_mode_var,
             values=["None (2-second intervals)", "Whisper AI (Smart Sync)"],
@@ -674,7 +675,7 @@ class AppleStyleApp:
             self.log(f"-> Successfully downloaded: {title}")
             if self.download_manager:
                 self.root.after(0, self.download_manager.set_item_status, index, "Finished", "#34C759")
-            self._maybe_generate_srt(title, subs, aligner, errors_found)
+            self._maybe_generate_srt(title, subs, aligner, errors_found, error_lock)
             return True
         else:
             self.log(f"-> Error downloading: {title} (Return code: {return_code})")
@@ -717,16 +718,16 @@ class AppleStyleApp:
             self.log(f"Starting downloads (Mode: {'Concurrent' if concurrent_mode else 'Sequential'}, Workers: {max_workers})...")
             
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = []
+                futures = {}
                 for i, title, link, subs in items:
-                    futures.append(executor.submit(
+                    futures[executor.submit(
                         self._download_item_worker, i, title, link, subs, aligner, errors_found, error_lock
-                    ))
+                    )] = i
                 
-                for idx, future in enumerate(futures):
+                for future, item_index in futures.items():
                     success = future.result()
-                    if not success and not self._is_cancelled() and idx not in self.cancelled_indices:
-                        failed_items.append(items[idx])
+                    if not success and not self._is_cancelled() and item_index not in self.cancelled_indices:
+                        failed_items.append(items[item_index])
 
             # Phase 2: Retry Failed Items
             if failed_items and not self._is_cancelled():
@@ -787,6 +788,7 @@ class AppleStyleApp:
         subs: Sequence[str],
         aligner: Optional[WhisperAligner],
         errors_found: List[str],
+        error_lock: Optional[threading.Lock] = None,
     ) -> None:
         if not subs:
             return
@@ -809,7 +811,12 @@ class AppleStyleApp:
                 except Exception as e:
                     logger.exception("Whisper sync failed for %s", title)
                     self.log(f"-> Error with Whisper Sync: {e}")
-                    errors_found.append(f"Whisper Error for '{title}': {e}")
+                    err_msg = f"Whisper Error for '{title}': {e}"
+                    if error_lock:
+                        with error_lock:
+                            errors_found.append(err_msg)
+                    else:
+                        errors_found.append(err_msg)
                     self.log("-> Falling back to 2-second timestamps...")
             else:
                 self.log("-> No matching dub found in folder. Falling back to 2-second timestamps.")
