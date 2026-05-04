@@ -70,7 +70,16 @@ def _download_yt_dlp(base_path: Path, log: LogFn) -> None:
     if target.exists():
         return
     log("-> Downloading yt-dlp.exe...")
-    _download(YT_DLP_URL, target)
+    for attempt in range(3):
+        try:
+            _download(YT_DLP_URL, target)
+            if target.exists() and target.stat().st_size > 0:
+                break
+        except Exception as e:
+            log(f"-> Error downloading yt-dlp (Attempt {attempt + 1}/3): {e}")
+            _safe_unlink(target, log)
+    if not target.exists() or target.stat().st_size == 0:
+        raise RuntimeError("yt-dlp download failed.")
     log("   Done!")
 
 
@@ -80,20 +89,23 @@ def _download_ffmpeg(base_path: Path, log: LogFn) -> None:
         return
     log("-> Downloading FFmpeg (this may take a moment)...")
     temp_zip = base_path / "ffmpeg.zip"
-    try:
-        _download(FFMPEG_URL, temp_zip)
-        log("-> Extracting FFmpeg...")
-        with zipfile.ZipFile(temp_zip, "r") as zf:
-            for member in zf.namelist():
-                if member.endswith("ffmpeg.exe"):
-                    with zf.open(member) as src, target.open("wb") as dst:
-                        shutil.copyfileobj(src, dst)
-                    break
-    except zipfile.BadZipFile:
-        log("-> Error: FFmpeg download was corrupted (Invalid ZIP). Please try again.")
-        _safe_unlink(target, log)
-    finally:
-        _safe_unlink(temp_zip, log)
+    for attempt in range(3):
+        try:
+            _download(FFMPEG_URL, temp_zip)
+            log("-> Extracting FFmpeg...")
+            with zipfile.ZipFile(temp_zip, "r") as zf:
+                for member in zf.namelist():
+                    if member.endswith("ffmpeg.exe"):
+                        with zf.open(member) as src, target.open("wb") as dst:
+                            shutil.copyfileobj(src, dst)
+                        break
+            if target.exists():
+                break
+        except Exception as e:
+            log(f"-> Error downloading/extracting FFmpeg (Attempt {attempt + 1}/3): {e}")
+            _safe_unlink(target, log)
+        finally:
+            _safe_unlink(temp_zip, log)
     if not target.exists():
         raise RuntimeError("FFmpeg extraction failed.")
     log("   Done!")
@@ -105,15 +117,19 @@ def _download_deno(base_path: Path, log: LogFn) -> None:
         return
     log("-> Downloading Deno (JS runtime for YouTube extraction)...")
     temp_zip = base_path / "deno.zip"
-    try:
-        _download(DENO_URL, temp_zip)
-        log("-> Extracting Deno...")
-        with zipfile.ZipFile(temp_zip, "r") as zf:
-            zf.extractall(base_path)
-    except zipfile.BadZipFile:
-        log("-> Error: Deno download was corrupted. Please try again.")
-    finally:
-        _safe_unlink(temp_zip, log)
+    for attempt in range(3):
+        try:
+            _download(DENO_URL, temp_zip)
+            log("-> Extracting Deno...")
+            with zipfile.ZipFile(temp_zip, "r") as zf:
+                zf.extractall(base_path)
+            if target.exists():
+                break
+        except Exception as e:
+            log(f"-> Error downloading/extracting Deno (Attempt {attempt + 1}/3): {e}")
+            _safe_unlink(target, log)
+        finally:
+            _safe_unlink(temp_zip, log)
     if not target.exists():
         raise RuntimeError("Deno extraction failed.")
     log("   Done!")

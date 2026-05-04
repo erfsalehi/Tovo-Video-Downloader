@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import tkinter as tk
-from typing import Callable, Optional, Tuple
+from tkinter import ttk
+from typing import Callable, List, Optional, Tuple
 
 
 class RoundedButton(tk.Canvas):
@@ -84,3 +85,142 @@ class RoundedButton(tk.Canvas):
         self._draw()
         if self.disabled:
             self.config(cursor="arrow")
+
+
+class DownloadItem(tk.Frame):
+    """A minimal row representing one video's status."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        title: str,
+        on_cancel: Callable[[], None],
+        bg_color: str,
+        text_color: str,
+        accent_color: str,
+        font_family: str,
+    ) -> None:
+        super().__init__(parent, bg="white", padx=10, pady=5)
+        self.title = title
+        self.on_cancel = on_cancel
+        self.accent_color = accent_color
+
+        self.columnconfigure(0, weight=3)  # Title
+        self.columnconfigure(1, weight=2)  # Progress
+        self.columnconfigure(2, minsize=40) # %
+        self.columnconfigure(3, minsize=80) # Status
+
+        # Title (truncated)
+        short_title = (title[:37] + "..") if len(title) > 40 else title
+        self.title_label = tk.Label(
+            self, text=short_title, bg="white", fg=text_color,
+            font=(font_family, 9), anchor="w",
+        )
+        self.title_label.grid(row=0, column=0, sticky="ew")
+
+        # Progress bar
+        style = ttk.Style()
+        style.configure(
+            "Minimal.Horizontal.TProgressbar",
+            thickness=4,
+            background=accent_color,
+            troughcolor="#F2F2F7",
+            borderwidth=0,
+        )
+        
+        self.progress_var = tk.DoubleVar(value=0)
+        self.progress = ttk.Progressbar(
+            self, variable=self.progress_var, maximum=100,
+            style="Minimal.Horizontal.TProgressbar",
+        )
+        self.progress.grid(row=0, column=1, sticky="ew", padx=10)
+
+        self.percent_label = tk.Label(
+            self, text="0%", bg="white", fg="#86868B",
+            font=(font_family, 8, "bold"),
+        )
+        self.percent_label.grid(row=0, column=2, sticky="e")
+
+        self.status_label = tk.Label(
+            self, text="Waiting", bg="white", fg="#C7C7CC",
+            font=(font_family, 8), width=10, anchor="e"
+        )
+        self.status_label.grid(row=0, column=3, sticky="e", padx=(5, 5))
+
+        self.cancel_btn = tk.Button(
+            self, text="✕", font=(font_family, 7),
+            command=self.on_cancel, bg="white", fg="#FF3B30",
+            relief=tk.FLAT, bd=0, cursor="hand2",
+            activebackground="white", activeforeground="#D70A01",
+        )
+        self.cancel_btn.grid(row=0, column=4, sticky="e")
+
+    def update_progress(self, percent: float) -> None:
+        self.progress_var.set(percent)
+        self.percent_label.config(text=f"{int(percent)}%")
+        if self.status_label["text"] not in ("Finished", "Failed", "Cancelled"):
+            self.status_label.config(text="Active", fg=self.accent_color)
+
+    def set_status(self, status: str, color: Optional[str] = None) -> None:
+        self.status_label.config(text=status)
+        if color:
+            self.status_label.config(fg=color)
+        if status in ("Finished", "Failed", "Cancelled"):
+            self.cancel_btn.grid_remove()
+            if status == "Finished":
+                self.progress_var.set(100)
+                self.percent_label.config(text="100%")
+
+
+class DownloadManager(tk.Frame):
+    """An embedded manager for tracking multiple downloads."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        titles: List[str],
+        on_cancel_item: Callable[[int], None],
+        bg_color: str,
+        text_color: str,
+        accent_color: str,
+        font_family: str,
+    ) -> None:
+        super().__init__(parent, bg="white", highlightbackground="#D2D2D7", highlightthickness=1)
+        
+        # Scrollable area
+        self.canvas = tk.Canvas(self, bg="white", highlightthickness=0)
+        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.scrollable_frame = tk.Frame(self.canvas, bg="white")
+
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        )
+        self.canvas_window = self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar.pack(side="right", fill="y")
+
+        def _on_canvas_configure(event):
+            self.canvas.itemconfig(self.canvas_window, width=event.width)
+        self.canvas.bind("<Configure>", _on_canvas_configure)
+
+        self.items: List[DownloadItem] = []
+        for i, title in enumerate(titles):
+            item = DownloadItem(
+                self.scrollable_frame, title, lambda idx=i: on_cancel_item(idx),
+                bg_color, text_color, accent_color, font_family
+            )
+            item.pack(fill=tk.X)
+            self.items.append(item)
+
+    def update_item_progress(self, index: int, percent: float) -> None:
+        if 0 <= index < len(self.items):
+            self.items[index].update_progress(percent)
+
+    def set_item_status(self, index: int, status: str, color: Optional[str] = None) -> None:
+        if 0 <= index < len(self.items):
+            self.items[index].set_status(status, color)
+
+

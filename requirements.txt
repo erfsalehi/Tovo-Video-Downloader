@@ -3,7 +3,7 @@ yt-dlp>=2024.8.6
 
 # Whisper AI smart-sync (optional but recommended).
 # Loaded lazily; downloads will still work without it.
-stable-whisper>=2.17.0
+stable-ts>=2.17.0
 
 # Torch is installed separately on Windows by Start.bat (CPU-only build, ~200MB).
 # On Linux/macOS, install manually if you want Whisper sync:

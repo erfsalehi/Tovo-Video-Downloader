@@ -14,7 +14,7 @@ from typing import List, Optional, Sequence
 from config import Config
 from dependencies import find_missing_tools, install_all
 from subtitles import WhisperAligner, generate_standard_srt
-from widgets import RoundedButton
+from widgets import DownloadManager, RoundedButton
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +64,8 @@ class AppleStyleApp:
 
         self.root.configure(bg=self.bg_color)
         self._build_ui()
+        self.download_manager: Optional[DownloadManager] = None
+        self.cancelled_indices: set[int] = set()
 
         self.root.after(500, self.check_dependencies)
 
@@ -419,6 +421,20 @@ class AppleStyleApp:
 
         return titles, links, subtitles_list
 
+    def _cancel_single_item(self, index: int) -> None:
+        with self._state_lock:
+            self.cancelled_indices.add(index)
+            if self.download_manager:
+                self.download_manager.set_item_status(index, "Cancelled", "#86868B")
+            
+            # If the currently downloading item is cancelled, kill its process
+            # We'll need to know which index is currently downloading.
+            # I'll add self.current_index for this.
+            if getattr(self, "current_index", -1) == index:
+                proc = self.current_process
+                if proc:
+                    self._terminate_process(proc)
+
     def start_download(self) -> None:
         with self._state_lock:
             if self.downloading:
@@ -477,6 +493,16 @@ class AppleStyleApp:
         self.input_text.config(state="disabled", bg="#F5F5F7")
 
         sync_mode = self.sync_mode_var.get()
+        self.cancelled_indices = set()
+        
+        # Hide input, show manager
+        self.input_frame.grid_remove()
+        self.download_manager = DownloadManager(
+            self.main_frame, titles, self._cancel_single_item,
+            self.bg_color, self.text_color, self.accent_color, self.font_family
+        )
+        self.download_manager.grid(row=2, column=0, sticky="nsew", pady=(0, 15))
+
         threading.Thread(
             target=self.download_process,
             args=(titles, links, subtitles_list, sync_mode),
@@ -495,8 +521,6 @@ class AppleStyleApp:
                         tf.write(subtitles_list[i][0] + "\n")
                         tf.write(subtitles_list[i][1] + "\n\n")
                         subtitles_list[i] = subtitles_list[i][2:]
-                    else:
-                        subtitles_list[i] = []
             self.log("-> Saved ignored lines to Titles.txt")
         except OSError as e:
             self.log(f"-> Warning: Could not save Titles.txt: {e}")
@@ -547,19 +571,35 @@ class AppleStyleApp:
         cmd.append(link)
         return cmd
 
-    def _run_yt_dlp(self, cmd: List[str]) -> int:
+    def _run_yt_dlp(self, cmd: List[str], progress_callback: Optional[Callable[[float], None]] = None) -> int:
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, creationflags=creationflags,
         )
         self._set_current_process(proc)
+        
+        # Regex for yt-dlp progress: [download]  10.0% of ...
+        progress_re = re.compile(r"\[download\]\s+(\d+\.\d+)%")
+
         try:
             assert proc.stdout is not None
             for line in proc.stdout:
                 if self._is_cancelled():
                     break
-                self.log("  " + line.strip())
+                
+                clean_line = line.strip()
+                if clean_line:
+                    self.log("  " + clean_line)
+                    if progress_callback:
+                        match = progress_re.search(clean_line)
+                        if match:
+                            try:
+                                percent = float(match.group(1))
+                                progress_callback(percent)
+                            except ValueError:
+                                pass
+
             try:
                 proc.wait(timeout=PROCESS_TERMINATE_TIMEOUT)
             except subprocess.TimeoutExpired:
@@ -586,27 +626,42 @@ class AppleStyleApp:
             self._save_batch_links(titles, links)
             errors_found: List[str] = []
 
-            for i, (title, link, subs) in enumerate(zip(titles, links, subtitles_list), 1):
-                if self._is_cancelled():
-                    break
+            for i, (title, link, subs) in enumerate(zip(titles, links, subtitles_list)):
+                self.current_index = i
+                if self._is_cancelled() or i in self.cancelled_indices:
+                    if i in self.cancelled_indices:
+                        self.log(f"\n[{i+1}/{len(titles)}] Skipping (Cancelled): {title}")
+                    continue
 
-                self.log(f"\n[{i}/{len(titles)}] Downloading: {title}")
+                self.log(f"\n[{i+1}/{len(titles)}] Downloading: {title}")
                 self.log(f"URL: {link}")
 
                 cmd = self._build_yt_dlp_command(title, link)
+                if self._is_cancelled() or i in self.cancelled_indices:
+                    continue
+
+                def update_ui(p: float):
+                    if self.download_manager:
+                        self.root.after(0, self.download_manager.update_item_progress, i, p)
+
+                return_code = self._run_yt_dlp(cmd, progress_callback=update_ui)
+
                 if self._is_cancelled():
                     break
-
-                return_code = self._run_yt_dlp(cmd)
-
-                if self._is_cancelled():
-                    break
+                
+                if i in self.cancelled_indices:
+                    self.log(f"-> Item cancelled: {title}")
+                    continue
 
                 if return_code == 0:
                     self.log(f"-> Successfully downloaded: {title}")
+                    if self.download_manager:
+                        self.root.after(0, self.download_manager.set_item_status, i, "Finished", "#34C759")
                     self._maybe_generate_srt(title, subs, aligner, errors_found)
                 else:
                     self.log(f"-> Error downloading: {title} (Return code: {return_code})")
+                    if self.download_manager:
+                        self.root.after(0, self.download_manager.set_item_status, i, "Failed", "#FF3B30")
                     errors_found.append(
                         f"Download Error for '{title}': Process exited with code {return_code}"
                     )
@@ -623,6 +678,10 @@ class AppleStyleApp:
                 if self._is_cancelled()
                 else "\nBatch download complete."
             )
+            if self.download_manager:
+                self.root.after(0, self.download_manager.destroy)
+                self.download_manager = None
+            self.input_frame.grid()
             self.root.after(0, self.reset_ui)
 
     def _save_batch_links(self, titles: Sequence[str], links: Sequence[str]) -> None:
