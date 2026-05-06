@@ -248,12 +248,13 @@ class AppleStyleApp:
 
         self._build_transcription_settings(prov_frame)
 
-        # Cookie row for transcription
+        # Cookie row for transcription (Now tab-specific)
         cookie_frame = tk.Frame(parent, bg=self.bg_color)
         cookie_frame.grid(row=4, column=0, sticky="ew", pady=(0, 12), padx=10)
+        self.trans_use_browser_cookies = tk.BooleanVar(value=self.config.get("trans_use_browser_cookies", False))
         ModernCheckbutton(
             cookie_frame, text="Use Chrome Cookies (Bypass Bot Detection)",
-            variable=self.use_browser_cookies, bg_color=self.bg_color,
+            variable=self.trans_use_browser_cookies, bg_color=self.bg_color,
             command=self._save_config,
         ).pack(side=tk.LEFT)
 
@@ -515,6 +516,7 @@ class AppleStyleApp:
         self.config.set("groq_api_key", self.groq_key_var.get())
         self.config.set("trans_concurrent", self.trans_concurrent_var.get())
         self.config.set("trans_max_concurrent", self.trans_max_concurrent_var.get())
+        self.config.set("trans_use_browser_cookies", self.trans_use_browser_cookies.get())
         self.config.save()
 
     def browse_directory(self) -> None:
@@ -1528,7 +1530,7 @@ class AppleStyleApp:
         cookies_txt = BASE_PATH / "cookies.txt"
         if cookies_txt.exists():
             cmd.extend(["--cookies", str(cookies_txt)])
-        elif self.use_browser_cookies.get():
+        elif self.trans_use_browser_cookies.get():
             cmd.extend(["--cookies-from-browser", "chrome"])
 
         deno_exe = BASE_PATH / "deno.exe"
