@@ -51,17 +51,25 @@ def _safe_unlink(path: Path, log: LogFn) -> None:
         log(f"-> Warning: Could not remove {path.name}: {e}")
 
 
+def _has_binary(base_path: Path, name: str) -> bool:
+    return bool(shutil.which(name)) or (base_path / f"{name}.exe").exists()
+
+
 def find_missing_tools(base_path: Path) -> List[str]:
-    """Return human-readable names for any tool not on PATH or alongside the script."""
+    """Return human-readable names for any tool not on PATH or alongside the script.
+
+    yt-dlp's audio-extraction post-processor needs both ``ffmpeg`` *and*
+    ``ffprobe`` (ffprobe is used to identify the source audio codec). Both
+    binaries ship in the ffmpeg-essentials zip; we treat them as a single
+    "FFmpeg" requirement and force a re-download if either is missing.
+    """
     missing: List[str] = []
-    checks = (
-        ("yt-dlp", "yt-dlp", "yt-dlp.exe"),
-        ("FFmpeg", "ffmpeg", "ffmpeg.exe"),
-        ("Deno (JS Runtime)", "deno", "deno.exe"),
-    )
-    for label, cli, local in checks:
-        if not (shutil.which(cli) or (base_path / local).exists()):
-            missing.append(label)
+    if not _has_binary(base_path, "yt-dlp"):
+        missing.append("yt-dlp")
+    if not (_has_binary(base_path, "ffmpeg") and _has_binary(base_path, "ffprobe")):
+        missing.append("FFmpeg")
+    if not _has_binary(base_path, "deno"):
+        missing.append("Deno (JS Runtime)")
     return missing
 
 
@@ -83,31 +91,46 @@ def _download_yt_dlp(base_path: Path, log: LogFn) -> None:
     log("   Done!")
 
 
+FFMPEG_BINARIES = ("ffmpeg.exe", "ffprobe.exe")
+
+
 def _download_ffmpeg(base_path: Path, log: LogFn) -> None:
-    target = base_path / "ffmpeg.exe"
-    if target.exists() or shutil.which("ffmpeg"):
+    targets = {name: base_path / name for name in FFMPEG_BINARIES}
+
+    # Skip only if every required binary is already available somewhere.
+    if all(
+        target.exists() or shutil.which(target.stem)
+        for target in targets.values()
+    ):
         return
+
     log("-> Downloading FFmpeg (this may take a moment)...")
     temp_zip = base_path / "ffmpeg.zip"
     for attempt in range(3):
         try:
             _download(FFMPEG_URL, temp_zip)
-            log("-> Extracting FFmpeg...")
+            log("-> Extracting FFmpeg + ffprobe...")
             with zipfile.ZipFile(temp_zip, "r") as zf:
+                remaining = dict(targets)
                 for member in zf.namelist():
-                    if member.endswith("ffmpeg.exe"):
-                        with zf.open(member) as src, target.open("wb") as dst:
+                    name = Path(member).name
+                    if name in remaining:
+                        with zf.open(member) as src, remaining[name].open("wb") as dst:
                             shutil.copyfileobj(src, dst)
-                        break
-            if target.exists():
+                        del remaining[name]
+                        if not remaining:
+                            break
+            if all(t.exists() for t in targets.values()):
                 break
         except Exception as e:
             log(f"-> Error downloading/extracting FFmpeg (Attempt {attempt + 1}/3): {e}")
-            _safe_unlink(target, log)
+            for t in targets.values():
+                _safe_unlink(t, log)
         finally:
             _safe_unlink(temp_zip, log)
-    if not target.exists():
-        raise RuntimeError("FFmpeg extraction failed.")
+    missing = [t.name for t in targets.values() if not t.exists()]
+    if missing:
+        raise RuntimeError(f"FFmpeg extraction failed (missing: {', '.join(missing)}).")
     log("   Done!")
 
 
