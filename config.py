@@ -17,6 +17,7 @@ DEFAULTS: dict[str, Any] = {
     "max_concurrent": 5,
     "groq_api_key": "",
     "transcription_provider": "Local Whisper",
+    "disable_proxy": True,
 }
 
 

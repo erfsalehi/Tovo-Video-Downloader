@@ -175,15 +175,6 @@ class DownloadItem(tk.Frame):
         self.skip_btn.grid(row=0, column=6, sticky="e", padx=(4, 0))
         self.skip_btn.grid_remove()
 
-        # Transcribe button — appears when finished
-        self.transcribe_btn = RoundedButton(
-            self, text="✎ Transcribe", 
-            radius=12, bg_color=accent_color, hover_color="#4B49B8",
-            text_color="white", font=(font_family, 8, "bold"),
-            width=90, height=26
-        )
-        self.transcribe_btn.grid(row=0, column=7, sticky="e", padx=(10, 0))
-        self.transcribe_btn.grid_remove()
 
     def set_on_retry(self, callback: Callable[[], None]) -> None:
         """Attach the retry callback (called after construction by DownloadManager)."""
@@ -193,9 +184,6 @@ class DownloadItem(tk.Frame):
         """Attach the skip callback (called after construction by DownloadManager)."""
         self.skip_btn.config(command=callback)
 
-    def set_on_transcribe(self, callback: Callable[[], None]) -> None:
-        """Attach the transcribe callback."""
-        self.transcribe_btn.command = callback
 
     def update_progress(self, percent: float) -> None:
         self.progress_var.set(percent)
@@ -227,11 +215,7 @@ class DownloadItem(tk.Frame):
             if status == "Finished":
                 self.progress_var.set(100)
                 self.percent_label.config(text="100%")
-                self.transcribe_btn.grid()
-            else:
-                self.transcribe_btn.grid_remove()
         elif status == "Transcribing...":
-            self.transcribe_btn.grid_remove()
             self.status_label.config(text="Transcribing...", fg="#FF9500")
 
 
@@ -280,7 +264,6 @@ class DownloadManager(tk.Frame):
             )
             item.set_on_retry(lambda idx=i: on_retry_item(idx))
             item.set_on_skip(lambda idx=i: on_skip_item(idx))
-            item.set_on_transcribe(lambda idx=i: on_transcribe_item(idx))
             item.pack(fill=tk.X)
             self.items.append(item)
 

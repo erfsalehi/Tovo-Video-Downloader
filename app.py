@@ -35,16 +35,21 @@ def sanitize_filename(name: str) -> str:
 
 
 def parse_titles_and_links(text: str):
-    """Utility for transcription tab to parse Title + Link pairs."""
+    """Utility for transcription tab to parse Title + Link pairs.
+    Handles Title-on-prev-line OR just links alone.
+    """
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     titles: List[str] = []
     links: List[str] = []
     
-    # Simple logic: line 1 title, line 2 link, etc.
-    # If a line is a URL, assume the previous line was the title.
     for i, line in enumerate(lines):
-        if line.lower().startswith(URL_PREFIXES) and i > 0:
-            titles.append(lines[i-1])
+        if line.lower().startswith(URL_PREFIXES):
+            # If previous line wasn't a URL, use it as title
+            if i > 0 and not lines[i-1].lower().startswith(URL_PREFIXES):
+                titles.append(lines[i-1])
+            else:
+                # Use a portion of the URL or a generic title
+                titles.append(f"Video_{len(links)+1}")
             links.append(line)
             
     return titles, links
@@ -63,8 +68,10 @@ class AppleStyleApp:
         if not self.config.get("downloads_dir"):
             self.config.set("downloads_dir", str(BASE_PATH / "Downloads"))
         self.downloads_dir = Path(self.config.get("downloads_dir"))
+        self.trans_dir = Path(self.config.get("trans_dir", str(BASE_PATH / "Transcriptions")))
         self.dub_dir = self.config.get("dub_dir", "")
         self.downloads_dir.mkdir(parents=True, exist_ok=True)
+        self.trans_dir.mkdir(parents=True, exist_ok=True)
 
         # Apple-like palette
         self.bg_color = "#F5F5F7"
@@ -83,6 +90,7 @@ class AppleStyleApp:
         self.errors_lock = threading.Lock()
 
         self.root.configure(bg=self.bg_color)
+        self._build_menu()
         self._build_ui()
         self.download_manager: Optional[DownloadManager] = None
         self.cancelled_indices: set[int] = set()
@@ -192,7 +200,7 @@ class AppleStyleApp:
         self.dl_input_text = tk.Text(
             inner, wrap=tk.WORD, font=(self.font_family, 11),
             bg="white", fg=self.text_color, insertbackground=self.accent_color,
-            relief=tk.FLAT, padx=10, pady=10,
+            relief=tk.FLAT, padx=10, pady=10, undo=True,
         )
         self.dl_input_text.grid(row=0, column=0, sticky="nsew")
 
@@ -236,7 +244,7 @@ class AppleStyleApp:
         self.trans_input_text = tk.Text(
             inner, wrap=tk.WORD, font=(self.font_family, 11),
             bg="white", fg=self.text_color, insertbackground=self.accent_color,
-            relief=tk.FLAT, padx=10, pady=10,
+            relief=tk.FLAT, padx=10, pady=10, undo=True,
         )
         self.trans_input_text.grid(row=0, column=0, sticky="nsew")
 
@@ -246,11 +254,20 @@ class AppleStyleApp:
         self._bind_context_menu(self.trans_input_text)
         self.trans_border = border # Reference to hide it later
 
+        self._build_trans_save_row(parent, row=3)
+
+        prov_frame = tk.Frame(parent, bg=self.bg_color)
+        prov_frame.grid(row=4, column=0, sticky="ew", pady=(0, 10), padx=10)
         self._build_transcription_settings(prov_frame)
 
+        self._build_trans_concurrent_row(parent, row=5)
+        self._build_trans_cookie_row(parent, row=6)
+        self._build_trans_button_row(parent, row=7)
+
+    def _build_trans_cookie_row(self, parent: tk.Frame, row: int) -> None:
         # Cookie row for transcription (Now tab-specific)
         cookie_frame = tk.Frame(parent, bg=self.bg_color)
-        cookie_frame.grid(row=4, column=0, sticky="ew", pady=(0, 12), padx=10)
+        cookie_frame.grid(row=row, column=0, sticky="ew", pady=(0, 12), padx=10)
         self.trans_use_browser_cookies = tk.BooleanVar(value=self.config.get("trans_use_browser_cookies", False))
         ModernCheckbutton(
             cookie_frame, text="Use Chrome Cookies (Bypass Bot Detection)",
@@ -258,7 +275,6 @@ class AppleStyleApp:
             command=self._save_config,
         ).pack(side=tk.LEFT)
 
-        self._build_trans_button_row(parent, row=5)
 
     def _bind_context_menu(self, widget: tk.Text) -> None:
         menu = tk.Menu(self.root, tearoff=0)
@@ -269,8 +285,19 @@ class AppleStyleApp:
         menu.add_command(label="Select All", command=lambda: widget.tag_add(tk.SEL, "1.0", tk.END))
         
         def show_menu(event):
+            widget.focus_set()
             menu.tk_popup(event.x_root, event.y_root)
+        
         widget.bind("<Button-3>", show_menu)
+        
+        # Explicitly bind standard keyboard shortcuts for robustness
+        # Returning "break" prevents the event from being handled twice by Tkinter's default bindings.
+        widget.bind("<Control-v>", lambda e: (widget.event_generate("<<Paste>>"), "break")[1])
+        widget.bind("<Control-c>", lambda e: (widget.event_generate("<<Copy>>"), "break")[1])
+        widget.bind("<Control-x>", lambda e: (widget.event_generate("<<Cut>>"), "break")[1])
+        widget.bind("<Control-a>", lambda e: (widget.tag_add(tk.SEL, "1.0", tk.END), "break")[1])
+        widget.bind("<Control-z>", lambda e: (widget.event_generate("<<Undo>>"), "break")[1])
+        widget.bind("<Control-y>", lambda e: (widget.event_generate("<<Redo>>"), "break")[1])
 
     def _truncate(self, text: str, width: int, font: Tuple) -> str:
         """Truncate text to fit a pixel width using ellipsis."""
@@ -312,6 +339,33 @@ class AppleStyleApp:
             width=90, height=32,
         )
         self.browse_btn.grid(row=0, column=2, sticky="e", padx=(6, 0))
+
+    def _build_trans_save_row(self, parent: tk.Frame, row: int) -> None:
+        frame = tk.Frame(parent, bg=self.bg_color)
+        frame.grid(row=row, column=0, sticky="ew", pady=(0, 10), padx=10)
+        frame.grid_columnconfigure(1, weight=1)
+
+        tk.Label(
+            frame, text="Save Transcriptions to:", bg=self.bg_color, fg=self.text_color,
+            font=(self.font_family, 10, "bold"),
+        ).grid(row=0, column=0, sticky="w", padx=(0, 8))
+
+        self.trans_dir_label = tk.Label(
+            frame, text=str(self.trans_dir), bg=self.bg_color, fg="#5E5CE6",
+            font=(self.font_family, 10), anchor="w",
+        )
+        self.trans_dir_label.grid(row=0, column=1, sticky="ew")
+        self.trans_dir_label.bind("<Configure>", lambda e: self.trans_dir_label.config(
+            text=self._truncate(str(self.trans_dir), e.width, (self.font_family, 10))
+        ))
+
+        self.trans_browse_btn = RoundedButton(
+            frame, text="Browse…", command=self.browse_trans_directory,
+            radius=14, bg_color=self.gray_bg, hover_color=self.gray_hover,
+            text_color=self.text_color, font=(self.font_family, 10, "bold"),
+            width=90, height=32,
+        )
+        self.trans_browse_btn.grid(row=0, column=2, sticky="e", padx=(6, 0))
 
     def _build_dl_options_row(self, parent: tk.Frame, row: int) -> None:
         frame = tk.Frame(parent, bg=self.bg_color)
@@ -382,18 +436,34 @@ class AppleStyleApp:
         frame = tk.Frame(parent, bg=self.bg_color)
         frame.grid(row=row, column=0, sticky="ew", pady=(0, 10), padx=10)
 
+        # First row of advanced options
+        row1 = tk.Frame(frame, bg=self.bg_color)
+        row1.pack(fill="x")
+
         self.use_browser_cookies = tk.BooleanVar(value=self.config.get("use_browser_cookies", False))
         ModernCheckbutton(
-            frame, text="Use Chrome Cookies (as fallback)",
+            row1, text="Use Chrome Cookies (fallback)",
             variable=self.use_browser_cookies, bg_color=self.bg_color,
             command=self._save_config,
         ).pack(side=tk.LEFT)
 
-        RoundedButton(
-            frame, text="Clear Cookies", command=self.clear_local_cookies,
-            radius=12, bg_color=self.gray_bg, hover_color=self.gray_hover,
-            text_color=self.text_color, font=(self.font_family, 9), width=110, height=30,
-        ).pack(side=tk.RIGHT)
+        # Second row of advanced options
+        row2 = tk.Frame(frame, bg=self.bg_color)
+        row2.pack(fill="x", pady=(5, 0))
+
+        self.disable_proxy_var = tk.BooleanVar(value=self.config.get("disable_proxy", False))
+        ModernCheckbutton(
+            row2, text="Disable System Proxy (Fix 127.0.0.1 errors)",
+            variable=self.disable_proxy_var, bg_color=self.bg_color,
+            command=self._save_config,
+        ).pack(side=tk.LEFT)
+
+        self.use_tv_client_var = tk.BooleanVar(value=self.config.get("use_tv_client", False))
+        ModernCheckbutton(
+            row2, text="TV Client (Bypass Bot detection)",
+            variable=self.use_tv_client_var, bg_color=self.bg_color,
+            command=self._save_config,
+        ).pack(side=tk.LEFT, padx=(15, 0))
 
     def _build_transcription_settings(self, parent: tk.Frame) -> None:
         tk.Label(
@@ -421,22 +491,26 @@ class AppleStyleApp:
         self.groq_key_entry.pack(side=tk.LEFT)
         self.groq_key_entry.entry.bind("<FocusOut>", lambda e: self._save_config())
 
-        # Concurrency for transcription
+    def _build_trans_concurrent_row(self, parent: tk.Frame, row: int) -> None:
+        frame = tk.Frame(parent, bg=self.bg_color)
+        frame.grid(row=row, column=0, sticky="ew", pady=(0, 10), padx=10)
+
         self.trans_concurrent_var = tk.BooleanVar(value=self.config.get("trans_concurrent", False))
         ModernCheckbutton(
-            parent, text="Simultaneous Transcriptions",
+            frame, text="Simultaneous Transcriptions",
             variable=self.trans_concurrent_var, bg_color=self.bg_color,
             command=self._save_config,
-        ).pack(side=tk.LEFT, padx=(20, 0))
+        ).pack(side=tk.LEFT)
 
         self.trans_max_concurrent_var = tk.IntVar(value=self.config.get("trans_max_concurrent", 5))
-        tk.Label(parent, text="Max:", bg=self.bg_color, fg=self.text_color,
-                 font=(self.font_family, 10)).pack(side=tk.LEFT, padx=(10, 4))
+        tk.Label(frame, text="Max:", bg=self.bg_color, fg=self.text_color,
+                 font=(self.font_family, 10)).pack(side=tk.LEFT, padx=(15, 4))
         self.trans_max_concurrent_spin = tk.Spinbox(
-            parent, from_=1, to=20, textvariable=self.trans_max_concurrent_var,
+            frame, from_=1, to=20, textvariable=self.trans_max_concurrent_var,
             width=3, font=(self.font_family, 10), command=self._save_config,
         )
         self.trans_max_concurrent_spin.pack(side=tk.LEFT)
+
 
     def _build_dl_button_row(self, parent: tk.Frame, row: int) -> None:
         frame = tk.Frame(parent, bg=self.bg_color)
@@ -508,6 +582,7 @@ class AppleStyleApp:
     # ------------------------------------------------------------------
     def _save_config(self) -> None:
         self.config.set("downloads_dir", str(self.downloads_dir))
+        self.config.set("trans_dir", str(self.trans_dir))
         self.config.set("dub_dir", self.dub_dir)
         self.config.set("concurrent_downloads", self.concurrent_var.get())
         self.config.set("max_concurrent", self.max_concurrent_var.get())
@@ -521,11 +596,20 @@ class AppleStyleApp:
 
     def browse_directory(self) -> None:
         selected = filedialog.askdirectory(
-            initialdir=str(self.downloads_dir), title="Select Save Location",
+            initialdir=str(self.downloads_dir), title="Select Video Save Location",
         )
         if selected:
             self.downloads_dir = Path(selected)
             self.dir_label.config(text=str(self.downloads_dir))
+            self._save_config()
+
+    def browse_trans_directory(self) -> None:
+        selected = filedialog.askdirectory(
+            initialdir=str(self.trans_dir), title="Select Transcription Save Location",
+        )
+        if selected:
+            self.trans_dir = Path(selected)
+            self.trans_dir_label.config(text=str(self.trans_dir))
             self._save_config()
 
     def browse_dub_directory(self) -> None:
@@ -534,6 +618,36 @@ class AppleStyleApp:
             self.dub_dir = os.path.normpath(selected)
             self.dub_dir_label.config(text=self.dub_dir)
             self._save_config()
+
+    def _build_menu(self) -> None:
+        """Create a professional menu bar for tool management."""
+        menubar = tk.Menu(self.root)
+        self.root.config(menu=menubar)
+        
+        file_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="File", menu=file_menu)
+        file_menu.add_command(label="Open Downloads", command=lambda: self._open_folder(self.downloads_dir))
+        file_menu.add_command(label="Open Transcriptions", command=lambda: self._open_folder(self.trans_dir))
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.root.quit)
+
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Tools", menu=tools_menu)
+        tools_menu.add_command(label="Force Update yt-dlp & FFmpeg", command=lambda: threading.Thread(target=self._download_tools_thread, daemon=True).start())
+        tools_menu.add_command(label="Clear local cookies.txt", command=self.clear_local_cookies)
+        
+        help_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Help", menu=help_menu)
+        help_menu.add_command(label="About", command=lambda: messagebox.showinfo("About", "Tovo Video Downloader v2.1\nA professional batch video & transcription tool."))
+
+    def _open_folder(self, path: Path) -> None:
+        try:
+            if os.name == "nt":
+                os.startfile(str(path))
+            else:
+                subprocess.run(["open", str(path)] if os.uname().sysname == "Darwin" else ["xdg-open", str(path)])
+        except Exception as e:
+            self.log(f"-> Could not open folder: {e}")
 
     def clear_local_cookies(self) -> None:
         cookies_txt = BASE_PATH / "cookies.txt"
@@ -664,21 +778,39 @@ class AppleStyleApp:
         return line.lower().startswith(URL_PREFIXES)
 
     def _parse_input(self, lines: Sequence[str]):
+        """Parses the bulk text input into (Titles, Links, Subtitles)."""
         titles: List[str] = []
         links: List[str] = []
         subtitles_list: List[List[str]] = []
 
+        # Find all link indices
         link_indices: List[int] = []
         for i, line in enumerate(lines):
-            if self._is_url(line) and i > 0 and not self._is_url(lines[i - 1]):
+            if self._is_url(line):
                 link_indices.append(i)
 
         for idx_pos, link_idx in enumerate(link_indices):
-            titles.append(lines[link_idx - 1])
+            # Title is the line before, IF it's not a URL
+            if link_idx > 0 and not self._is_url(lines[link_idx - 1]):
+                titles.append(lines[link_idx - 1])
+            else:
+                titles.append(f"Download_{len(links)+1}")
+                
             links.append(lines[link_idx])
 
+            # Subtitles/ignored lines are everything between this link and the next
             start = link_idx + 1
-            end = link_indices[idx_pos + 1] - 1 if idx_pos + 1 < len(link_indices) else len(lines)
+            # The next link OR if it's the last link, then the end of lines
+            if idx_pos + 1 < len(link_indices):
+                # If there's a title for the next link, stop before it
+                next_link_idx = link_indices[idx_pos + 1]
+                if next_link_idx > 0 and not self._is_url(lines[next_link_idx - 1]):
+                    end = next_link_idx - 1
+                else:
+                    end = next_link_idx
+            else:
+                end = len(lines)
+                
             subtitles_list.append(list(lines[start:end]))
 
         return titles, links, subtitles_list
@@ -697,12 +829,16 @@ class AppleStyleApp:
         """Manually retry a single failed item from the UI button."""
         if not hasattr(self, "_download_items") or index >= len(self._download_items):
             return
+        
+        title, link, subs = self._download_items[index]
+        self.log(f"-> Manually retrying item {index + 1}: {title}")
+        
         # Remove from cancelled set in case it was cancelled before
         self.cancelled_indices.discard(index)
-        title, link, subs = self._download_items[index]
         sync_mode = self.sync_mode_var.get()
 
         def _worker():
+            self.log(f"-> Manual retry started for item {index + 1}...")
             aligner: Optional[WhisperAligner] = None
             if sync_mode == "Whisper AI (Smart Sync)":
                 aligner = WhisperAligner.try_create(self.log)
@@ -710,6 +846,11 @@ class AppleStyleApp:
             success = self._download_item_worker(
                 index, title, link, subs, aligner, is_retry=True
             )
+            if success:
+                self.log(f"-> Manual retry succeeded for item {index + 1}!")
+            else:
+                self.log(f"-> Manual retry failed for item {index + 1}.")
+                
             with self.errors_lock:
                 if not success and self.batch_errors:
                     self._save_errors(self.batch_errors)
@@ -724,57 +865,11 @@ class AppleStyleApp:
                 self.download_manager.set_item_status(index, "Skipped", "#34C759")
             self.log(f"-> Item marked as skipped: {index + 1}")
 
-    def _handle_transcribe_item(self, index: int) -> None:
-        """Triggered by the 'Transcribe' button in the UI."""
-        if not hasattr(self, "_download_items") or index >= len(self._download_items):
-            return
-            
-        title, link, subs = self._download_items[index]
-        provider = self.trans_provider_var.get()
-        api_key = self.groq_key_var.get()
-        
-        def _worker():
-            self.root.after(0, self.download_manager.set_item_status, index, "Transcribing...", "#FF9500")
-            
-            safe_title = sanitize_filename(title)
-            srt_path = self.downloads_dir / f"{safe_title} (SRT).srt"
-            
-            audio_source = self._get_dub_track(title)
-            if not audio_source:
-                video_path = self.downloads_dir / f"{safe_title}.mp4"
-                if video_path.exists():
-                    audio_source = str(video_path)
-            
-            if not audio_source:
-                self.log(f"[!] Error: Could not find video/audio for transcription of '{title}'")
-                self.root.after(0, self.download_manager.set_item_status, index, "Failed (No File)", "#FF3B30")
-                return
-
-            success = False
-            if provider == "Groq AI (Fastest)":
-                transcriber = GroqTranscriber(self.log, api_key)
-                success = transcriber.transcribe(audio_source, srt_path, is_cancelled=self._is_cancelled)
-            else:
-                aligner = WhisperAligner.try_create(self.log)
-                if aligner:
-                    success = aligner.transcribe(audio_source, srt_path, is_cancelled=self._is_cancelled)
-                else:
-                    self.log("[!] Error: Local Whisper is not available.")
-
-            status = "Finished" if success else "Finished (Transcribe Failed)"
-            color = "#34C759" if success else "#FF3B30"
-            self.root.after(0, self.download_manager.set_item_status, index, status, color)
-
-        threading.Thread(target=_worker, daemon=True).start()
 
     def start_download(self) -> None:
         if self.downloading:
             # If we're showing the "Finish & Return" button, reset
             if self.download_btn.text == "Finish & Return":
-                if self.download_manager:
-                    self.download_manager.destroy()
-                    self.download_manager = None
-                self.dl_input_frame.grid()
                 self.reset_ui()
             return
 
@@ -854,7 +949,7 @@ class AppleStyleApp:
             self._cancel_single_item,
             self._manual_retry_item,
             self._skip_item,
-            self._handle_transcribe_item,
+            None,
             self.bg_color, self.text_color, self.accent_color, self.font_family
         )
         self.download_manager.grid(row=2, column=0, sticky="nsew", pady=(0, 15))
@@ -903,16 +998,19 @@ class AppleStyleApp:
         yt_dlp_exe = BASE_PATH / "yt-dlp.exe"
         exe_path = str(yt_dlp_exe) if yt_dlp_exe.exists() else "yt-dlp"
 
+        # Determine player clients
+        clients = "android,mweb"
+        if self.use_tv_client_var.get():
+            clients = "tv,mweb"
+            
         cmd: List[str] = [
             exe_path,
             "-o", output_path,
             "--no-playlist",
-            # H.264 (avc1) + AAC (m4a) keeps Premiere Pro happy.
-            "-f",
-            "bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]"
-            "/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "-f", "bv[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
             "--merge-output-format", "mp4",
-            "--extractor-args", "youtube:player_client=android,web",
+            "--extractor-args", f"youtube:player_client={clients};player_skip=webpage",
+            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         ]
 
         cookies_txt = BASE_PATH / "cookies.txt"
@@ -928,6 +1026,8 @@ class AppleStyleApp:
         ffmpeg_exe = BASE_PATH / "ffmpeg.exe"
         if ffmpeg_exe.exists():
             cmd.extend(["--ffmpeg-location", str(ffmpeg_exe)])
+        if self.disable_proxy_var.get():
+            cmd.extend(["--proxy", ""])
 
         cmd.append(link)
         return cmd
@@ -1017,7 +1117,8 @@ class AppleStyleApp:
             self._maybe_generate_srt(title, subs, aligner)
             return True
         else:
-            self.log(f"-> Error downloading: {title} (Return code: {return_code})")
+            self.log(f"-> Error downloading: {title} (Code: {return_code})")
+            self.log("   Check the log for details. Common fixes: update yt-dlp or check cookies.")
             if not is_retry:
                 if self.download_manager:
                     self.root.after(0, self.download_manager.set_item_status, index, "Failed (Queued for Retry)", "#FF9500")
@@ -1026,7 +1127,7 @@ class AppleStyleApp:
                     self.root.after(0, self.download_manager.set_item_status, index, "Failed", "#FF3B30")
             
             with self.errors_lock:
-                self.batch_errors.append(f"Download Error for '{title}': Process exited with code {return_code}")
+                self.batch_errors.append(f"Download Error for '{title}': Code {return_code}")
             return False
 
     def download_process(
@@ -1096,26 +1197,24 @@ class AppleStyleApp:
             logger.exception("Batch download crashed")
             self.log(f"\nAn error occurred: {e}")
         finally:
+            # Check if any items are still in "Failed" state after retries
             has_failures = False
             if self.download_manager:
                 for item in self.download_manager.items:
-                    if item.status_label["text"] == "Failed":
+                    if item.status_label["text"] in ("Failed", "Failed (Retry)"):
                         has_failures = True
                         break
 
-            if has_failures and not self._is_cancelled():
-                self.log("\nBatch finished with errors. You can manually Retry or Skip items now.")
+            if not self._is_cancelled():
+                if has_failures:
+                    self.log("\nBatch finished with errors. You can manually Retry or Skip items now.")
+                else:
+                    self.log("\nBatch download complete.")
+                
+                # Always allow user to review before returning
                 self.root.after(0, lambda: self.download_btn.config_state("normal", text="Finish & Return", bg="#34C759"))
             else:
-                self.log(
-                    "\nBatch download cancelled by user."
-                    if self._is_cancelled()
-                    else "\nBatch download complete."
-                )
-                if self.download_manager:
-                    self.root.after(0, self.download_manager.destroy)
-                    self.download_manager = None
-                self.dl_input_frame.grid()
+                self.log("\nBatch download cancelled by user.")
                 self.root.after(0, self.reset_ui)
 
     def _save_batch_links(self, titles: Sequence[str], links: Sequence[str]) -> None:
@@ -1205,6 +1304,9 @@ class AppleStyleApp:
     def start_transcription(self) -> None:
         """Called by the Start button on the Transcription tab."""
         if self.downloading:
+            # If we're showing the "Finish & Return" button, reset
+            if self.trans_btn.text == "Finish & Return":
+                self.reset_ui()
             return
 
         text = self.trans_input_text.get("1.0", tk.END).strip()
@@ -1344,7 +1446,7 @@ class AppleStyleApp:
             return False
 
     def _append_to_combined_report(self, title: str, link: str, transcript: str) -> None:
-        report_path = self.downloads_dir / "All_Transcriptions.txt"
+        report_path = self.trans_dir / "All_Transcriptions.txt"
         with self._state_lock: # Reuse state lock for file writing safety
             try:
                 first_write = not report_path.exists()
@@ -1363,7 +1465,7 @@ class AppleStyleApp:
         self.log(f"\n--- Starting Batch Transcription ({len(links)} items) ---")
         
         # Clear/initialize combined report at start of batch
-        report_path = self.downloads_dir / "All_Transcriptions.txt"
+        report_path = self.trans_dir / "All_Transcriptions.txt"
         if report_path.exists():
             try: report_path.unlink()
             except: pass
@@ -1429,14 +1531,19 @@ class AppleStyleApp:
 
         # (Removing the old result collection logic since we append in real-time now)
         
-        has_failures = any(item.status_label["text"] == "Failed" for item in self.trans_manager.items)
-        if has_failures and not self._is_cancelled():
-            self.log("\nBatch finished with errors. You can manually Retry or Skip items now.")
-            self.log(f"Partial results saved in: {report_path.name}")
+        # Batch finished logic
+        has_failures = any(item.status_label["text"] in ("Failed", "Failed (Retry)") for item in self.trans_manager.items)
+        if not self._is_cancelled():
+            if has_failures:
+                self.log("\nBatch finished with errors. You can manually Retry or Skip items now.")
+            else:
+                self.log("\n--- Batch Transcription Complete ---")
+            
+            self.log(f"Results saved in: {report_path.name}")
+            # Always show Finish & Return so user can see progress bars
             self.root.after(0, lambda: self.trans_btn.config_state("normal", text="Finish & Return", bg="#34C759"))
         else:
-            self.log("\n--- Batch Transcription Complete ---")
-            self.log(f"All results saved in: {report_path.name}")
+            self.log("\nBatch transcription cancelled by user.")
             self.root.after(0, self.reset_ui)
 
     def _save_combined_transcription_report(self, results: List[Tuple[str, str, str]]) -> None:
@@ -1512,7 +1619,8 @@ class AppleStyleApp:
     def _extract_audio_only(self, title: str, link: str, index: int = -1) -> Optional[str]:
         """Extracts mono audio to a temp file for transcription."""
         safe_title = sanitize_filename(title)
-        output_path = self.downloads_dir / f"{safe_title}_audio.mp3"
+        # Use trans_dir for temp audio if separate
+        output_path = self.trans_dir / f"{safe_title}_audio.mp3"
         
         yt_dlp_exe = BASE_PATH / "yt-dlp.exe"
         exe_path = str(yt_dlp_exe) if yt_dlp_exe.exists() else "yt-dlp"
@@ -1524,7 +1632,8 @@ class AppleStyleApp:
             "--audio-quality", "0",
             "-o", str(output_path),
             "--no-playlist",
-            "--extractor-args", "youtube:player_client=android,web",
+            "--extractor-args", "youtube:player_client=android,mweb;player_skip=webpage",
+            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         ]
 
         cookies_txt = BASE_PATH / "cookies.txt"
@@ -1559,7 +1668,7 @@ class AppleStyleApp:
 
     def _save_transcription_report(self, title: str, link: str, transcript: str) -> None:
         safe_title = sanitize_filename(title)
-        report_path = self.downloads_dir / f"{safe_title} (Transcript).txt"
+        report_path = self.trans_dir / f"{safe_title} (Transcript).txt"
         try:
             with report_path.open("w", encoding="utf-8") as f:
                 f.write(f"TITLE: {title}\n")
@@ -1577,10 +1686,12 @@ class AppleStyleApp:
             self.downloading = False
         
         # Reset Download Tab Buttons
-        self.download_btn.config_state("normal", text="Start Batch Download", bg=self.accent_color)
+        self.download_btn.config_state("normal", text="⬇  Start Batch Download", bg=self.accent_color)
         self.cancel_btn.config_state("disabled", bg="#E5E5EA")
         self.browse_btn.config_state("normal", bg=self.gray_bg)
         self.dl_input_text.config(state="normal", bg="white")
+        if hasattr(self, "dl_input_frame"):
+            self.dl_input_frame.grid()
         
         # Reset Transcription Tab Buttons
         self.trans_btn.config_state("normal", text="🎙  Start Transcription", bg=self.accent_color)
@@ -1588,10 +1699,24 @@ class AppleStyleApp:
         self.groq_key_entry.entry.config(state="normal")
         if hasattr(self, "trans_border"):
             self.trans_border.grid()
+            
+        # Clean up managers
+        if hasattr(self, "download_manager") and self.download_manager:
+            self.download_manager.destroy()
+            self.download_manager = None
+            
         if hasattr(self, "trans_manager") and self.trans_manager:
             self.trans_manager.destroy()
             self.trans_manager = None
+            
+        self.dl_input_text.config(state="normal", bg="white")
         self.trans_input_text.config(state="normal", bg="white")
+        
+        # Force focus back to the active tab's input area
+        if hasattr(self, "btn_dl_tab") and self.btn_dl_tab.text_color == self.accent_color:
+            self.dl_input_text.focus_set()
+        else:
+            self.trans_input_text.focus_set()
 
 
 def _enable_dpi_awareness() -> None:
