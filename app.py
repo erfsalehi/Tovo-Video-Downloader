@@ -246,12 +246,18 @@ class AppleStyleApp:
         self._bind_context_menu(self.trans_input_text)
         self.trans_border = border # Reference to hide it later
 
-        # Provider row
-        prov_frame = tk.Frame(parent, bg=self.bg_color)
-        prov_frame.grid(row=3, column=0, sticky="ew", pady=(0, 12), padx=10)
         self._build_transcription_settings(prov_frame)
 
-        self._build_trans_button_row(parent, row=4)
+        # Cookie row for transcription
+        cookie_frame = tk.Frame(parent, bg=self.bg_color)
+        cookie_frame.grid(row=4, column=0, sticky="ew", pady=(0, 12), padx=10)
+        ModernCheckbutton(
+            cookie_frame, text="Use Chrome Cookies (Bypass Bot Detection)",
+            variable=self.use_browser_cookies, bg_color=self.bg_color,
+            command=self._save_config,
+        ).pack(side=tk.LEFT)
+
+        self._build_trans_button_row(parent, row=5)
 
     def _bind_context_menu(self, widget: tk.Text) -> None:
         menu = tk.Menu(self.root, tearoff=0)
@@ -904,6 +910,7 @@ class AppleStyleApp:
             "bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]"
             "/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "--merge-output-format", "mp4",
+            "--extractor-args", "youtube:player_client=android,web",
         ]
 
         cookies_txt = BASE_PATH / "cookies.txt"
@@ -1515,6 +1522,7 @@ class AppleStyleApp:
             "--audio-quality", "0",
             "-o", str(output_path),
             "--no-playlist",
+            "--extractor-args", "youtube:player_client=android,web",
         ]
 
         cookies_txt = BASE_PATH / "cookies.txt"
