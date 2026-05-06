@@ -868,11 +868,13 @@ class AppleStyleApp:
 
 
     def start_download(self) -> None:
-        if self.downloading:
-            # If we're showing the "Finish & Return" button, reset
-            if self.download_btn.text == "Finish & Return":
-                self.reset_ui()
+        # Ignore the click while a batch is actively running.
+        if self.downloading and self.download_btn.text != "Finish & Return":
             return
+        # If the previous batch is in the "Finish & Return" review state,
+        # reset first and then process the new input in the same click.
+        if self.downloading:
+            self.reset_ui()
 
         text = self.dl_input_text.get("1.0", tk.END).strip()
         lines = [line.strip() for line in text.split("\n") if line.strip()]
@@ -1304,11 +1306,13 @@ class AppleStyleApp:
 
     def start_transcription(self) -> None:
         """Called by the Start button on the Transcription tab."""
-        if self.downloading:
-            # If we're showing the "Finish & Return" button, reset
-            if self.trans_btn.text == "Finish & Return":
-                self.reset_ui()
+        # Ignore the click while a batch is actively running.
+        if self.downloading and self.trans_btn.text != "Finish & Return":
             return
+        # If the previous batch is in the "Finish & Return" review state,
+        # reset first and then process the new input in the same click.
+        if self.downloading:
+            self.reset_ui()
 
         text = self.trans_input_text.get("1.0", tk.END).strip()
         if not text:
@@ -1328,11 +1332,11 @@ class AppleStyleApp:
         self.trans_cancel_btn.config_state("normal", bg="#FF3B30")
         self.groq_key_entry.entry.config(state="disabled")
         
-        # Hide input, show manager in transcription tab
-        self.trans_input_text.config(state="disabled") # Lock text
-        self.trans_input_text.grid_remove() 
-        # Wait, I need to make sure the input area can be hidden. 
-        # In _build_trans_tab, it's 'border'. I should save a reference to it.
+        # Hide input area: hiding the parent border also hides the inner text widget,
+        # so we don't grid_remove() the text widget separately (reset_ui only restores
+        # the border, and an independent grid_remove on the child would leave the
+        # input invisible after a batch).
+        self.trans_input_text.config(state="disabled")  # Lock text
         if hasattr(self, "trans_border"):
             self.trans_border.grid_remove()
 
