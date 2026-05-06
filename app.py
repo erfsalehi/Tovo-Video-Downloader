@@ -502,7 +502,8 @@ class AppleStyleApp:
             command=self._save_config,
         ).pack(side=tk.LEFT)
 
-        self.trans_max_concurrent_var = tk.IntVar(value=self.config.get("trans_max_concurrent", 5))
+        # Default to 2: TikTok / Instagram start returning 403 once you fan out wider.
+        self.trans_max_concurrent_var = tk.IntVar(value=self.config.get("trans_max_concurrent", 2))
         tk.Label(frame, text="Max:", bg=self.bg_color, fg=self.text_color,
                  font=(self.font_family, 10)).pack(side=tk.LEFT, padx=(15, 4))
         self.trans_max_concurrent_spin = tk.Spinbox(
@@ -1617,21 +1618,37 @@ class AppleStyleApp:
             except: pass
 
     def _extract_audio_only(self, title: str, link: str, index: int = -1) -> Optional[str]:
-        """Extracts mono audio to a temp file for transcription."""
+        """Download the audio-only stream and return its path.
+
+        Uses ``-f bestaudio/best`` so we never pull the video pixels and never
+        invoke yt-dlp's audio post-processor. Whisper (local + Groq) accept the
+        resulting m4a/webm natively, so ffmpeg/ffprobe stay out of the loop.
+        Also clears stale leftovers up-front so retries don't choke on a
+        corrupted partial from a previous run.
+        """
         safe_title = sanitize_filename(title)
-        # Use trans_dir for temp audio if separate
-        output_path = self.trans_dir / f"{safe_title}_audio.mp3"
-        
+        output_template = str(self.trans_dir / f"{safe_title}_audio.%(ext)s")
+
+        # Drop any leftover from a prior interrupted run before starting fresh.
+        for stale in self.trans_dir.glob(f"{safe_title}_audio.*"):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+
         yt_dlp_exe = BASE_PATH / "yt-dlp.exe"
         exe_path = str(yt_dlp_exe) if yt_dlp_exe.exists() else "yt-dlp"
 
-        # yt-dlp command to just get audio
         cmd = [
             exe_path,
-            "-x", "--audio-format", "mp3",
-            "--audio-quality", "0",
-            "-o", str(output_path),
+            "-f", "bestaudio/best",
+            "-o", output_template,
             "--no-playlist",
+            "--force-overwrites",
+            # Politeness throttle so TikTok / Instagram don't 403 us when running concurrently.
+            "--sleep-requests", "1",
+            "--sleep-interval", "1",
+            "--max-sleep-interval", "3",
             "--extractor-args", "youtube:player_client=android,mweb;player_skip=webpage",
             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         ]
@@ -1646,24 +1663,26 @@ class AppleStyleApp:
         if deno_exe.exists():
             cmd.extend(["--js-runtime", "deno:" + str(deno_exe)])
 
-        ffmpeg_exe = BASE_PATH / "ffmpeg.exe"
-        if ffmpeg_exe.exists():
-            cmd.extend(["--ffmpeg-location", str(ffmpeg_exe)])
-
         cmd.append(link)
-        
+
         self.log(f"-> Extracting audio for {title}...")
-        
+
         def audio_progress(p):
             if index >= 0 and hasattr(self, "trans_manager") and self.trans_manager:
-                self.root.after(0, self.trans_manager.update_item_progress, index, p * 0.1) # 0-10% for audio extract
+                self.root.after(0, self.trans_manager.update_item_progress, index, p * 0.1)
             elif index >= 0 and self.download_manager:
                 self.root.after(0, self.download_manager.update_item_progress, index, p * 0.1)
 
         return_code = self._run_yt_dlp(index, cmd, progress_callback=audio_progress)
-        
-        if return_code == 0 and output_path.exists():
-            return str(output_path)
+
+        if return_code != 0:
+            return None
+
+        # yt-dlp picked the source extension (.m4a / .webm / .mp3 / ...);
+        # find the file that actually landed.
+        matches = sorted(self.trans_dir.glob(f"{safe_title}_audio.*"))
+        if matches:
+            return str(matches[0])
         return None
 
     def _save_transcription_report(self, title: str, link: str, transcript: str) -> None:
