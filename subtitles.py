@@ -1,7 +1,11 @@
 """SRT generation and Whisper-based subtitle alignment."""
 from __future__ import annotations
 
+import json
 import logging
+import os
+import requests
+import subprocess
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence
 
@@ -76,6 +80,30 @@ class WhisperAligner:
             self.log(f"-> Loading Whisper '{self.model_name}' model (one-time)...")
             self._model = self._stable_whisper.load_model(self.model_name)
         return self._model
+
+    def transcribe_to_text(
+        self,
+        audio_source: str,
+        is_cancelled: CancelFn = lambda: False,
+    ) -> Optional[str]:
+        """Transcribe ``audio_source`` and return the full text transcript."""
+        if is_cancelled():
+            return None
+        model = self._ensure_model()
+
+        if is_cancelled():
+            return None
+        self.log("-> Transcribing audio with Whisper AI (Full Transcript)...")
+        
+        result = model.transcribe(audio_source)
+
+        if is_cancelled():
+            return None
+
+        # Concatenate segments into a clean paragraph
+        text = " ".join([s.text.strip() for s in result.segments])
+        self.log(f"-> Whisper transcription successful!")
+        return text
 
     def align(
         self,
@@ -176,3 +204,64 @@ class WhisperAligner:
                 word_idx += 1
             mapping.append(words)
         return mapping
+
+
+class GroqTranscriber:
+    """Uses Groq's cloud Whisper API for fast transcription."""
+
+    def __init__(self, log: LogFn, api_key: str) -> None:
+        self.log = log
+        self.api_key = api_key
+        self.url = "https://api.groq.com/openai/v1/audio/transcriptions"
+
+    def transcribe_to_text(
+        self,
+        audio_path: str,
+        is_cancelled: CancelFn = lambda: False,
+    ) -> Optional[str]:
+        if not self.api_key:
+            self.log("[!] Error: Groq API Key is missing in settings.")
+            return None
+
+        if is_cancelled():
+            return None
+        self.log("-> Preparing audio for Groq AI upload...")
+
+        temp_audio = str(Path(audio_path).with_suffix(".tmp.mp3"))
+        try:
+            cmd = [
+                "ffmpeg", "-y", "-i", audio_path,
+                "-vn", "-map_metadata", "-1", "-ac", "1", "-ar", "16000", "-b:a", "32k",
+                temp_audio
+            ]
+            creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            subprocess.run(cmd, capture_output=True, check=True, creationflags=creationflags)
+
+            if is_cancelled():
+                return None
+            self.log("-> Uploading to Groq AI (Whisper-large-v3)...")
+
+            with open(temp_audio, "rb") as f:
+                files = {"file": (os.path.basename(temp_audio), f, "audio/mpeg")}
+                data = {
+                    "model": "whisper-large-v3",
+                    "response_format": "text"
+                }
+                headers = {"Authorization": f"Bearer {self.api_key}"}
+                response = requests.post(self.url, headers=headers, files=files, data=data, timeout=60)
+
+            if response.status_code != 200:
+                self.log(f"[!] Groq API Error: {response.status_code} - {response.text}")
+                return None
+
+            self.log("-> Groq transcription successful!")
+            return response.text
+        except Exception as e:
+            self.log(f"[!] Error during Groq transcription: {e}")
+            return None
+        finally:
+            if os.path.exists(temp_audio):
+                try:
+                    os.remove(temp_audio)
+                except OSError:
+                    pass

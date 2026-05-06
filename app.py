@@ -14,8 +14,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 from config import Config
 from dependencies import find_missing_tools, install_all
-from subtitles import WhisperAligner, generate_standard_srt
-from widgets import DownloadManager, RoundedButton
+import requests
+from subtitles import WhisperAligner, GroqTranscriber, generate_standard_srt
+from widgets import DownloadManager, RoundedButton, RoundedEntry, ModernCheckbutton, RoundedFrame
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,22 @@ def sanitize_filename(name: str) -> str:
     cleaned = INVALID_FILENAME_CHARS.sub("_", name).strip(" .")
     cleaned = Path(cleaned).name  # drop any directory components
     return cleaned or "untitled"
+
+
+def parse_titles_and_links(text: str):
+    """Utility for transcription tab to parse Title + Link pairs."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    titles: List[str] = []
+    links: List[str] = []
+    
+    # Simple logic: line 1 title, line 2 link, etc.
+    # If a line is a URL, assume the previous line was the title.
+    for i, line in enumerate(lines):
+        if line.lower().startswith(URL_PREFIXES) and i > 0:
+            titles.append(lines[i-1])
+            links.append(line)
+            
+    return titles, links
 
 
 class AppleStyleApp:
@@ -79,217 +96,386 @@ class AppleStyleApp:
         self.root.grid_columnconfigure(0, weight=1)
         self.root.grid_rowconfigure(0, weight=1)
 
-        self.main_frame = tk.Frame(self.root, bg=self.bg_color)
-        self.main_frame.grid(row=0, column=0, sticky="nsew", padx=35, pady=20)
-        self.main_frame.grid_columnconfigure(0, weight=1)
-        self.main_frame.grid_rowconfigure(2, weight=1)
+        # Main container with some padding
+        container = tk.Frame(self.root, bg=self.bg_color)
+        container.grid(row=0, column=0, sticky="nsew", padx=25, pady=10)
+        container.grid_columnconfigure(0, weight=1)
+        container.grid_rowconfigure(1, weight=1) # Tab content area
 
-        tk.Label(
-            self.main_frame, text="Batch Downloader", bg=self.bg_color, fg=self.text_color,
-            font=(self.font_family, 26, "bold"),
-        ).grid(row=0, column=0, sticky="w", pady=(0, 5))
-
-        tk.Label(
-            self.main_frame,
-            text="Paste Title on line 1, Link on line 2, Title on line 3, etc.",
-            bg=self.bg_color, fg="#86868B", font=(self.font_family, 11),
-        ).grid(row=1, column=0, sticky="w", pady=(0, 10))
-
-        self._build_input_area()
-        self._build_save_row()
-        self._build_options_row()
-        self._build_dub_row()
-        self._build_advanced_row()
-        self._build_button_row()
-        self._build_log_area()
-
-    def _build_input_area(self) -> None:
-        self.input_frame = tk.Frame(
-            self.main_frame, bg="white", highlightbackground="#D2D2D7", highlightthickness=1,
+        # Custom Tab Switcher Row
+        tab_frame = tk.Frame(container, bg=self.bg_color)
+        tab_frame.grid(row=0, column=0, sticky="ew", pady=(0, 20))
+        
+        self.btn_dl_tab = RoundedButton(
+            tab_frame, text="Downloads", command=lambda: self._switch_tab("dl"),
+            radius=20, bg_color="white", hover_color=self.gray_hover,
+            text_color=self.accent_color, font=(self.font_family, 11, "bold"),
+            width=150, height=45
         )
-        self.input_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 15))
+        self.btn_dl_tab.pack(side=tk.LEFT, padx=(0, 10))
+        
+        self.btn_trans_tab = RoundedButton(
+            tab_frame, text="Transcription", command=lambda: self._switch_tab("trans"),
+            radius=20, bg_color=self.bg_color, hover_color=self.gray_hover,
+            text_color="#86868B", font=(self.font_family, 11, "bold"),
+            width=150, height=45
+        )
+        self.btn_trans_tab.pack(side=tk.LEFT)
 
-        self.input_text = tk.Text(
-            self.input_frame, wrap=tk.WORD, font=(self.font_family, 12),
+        # Tab Content Area
+        self.content_frame = tk.Frame(container, bg=self.bg_color)
+        self.content_frame.grid(row=1, column=0, sticky="nsew")
+        self.content_frame.grid_columnconfigure(0, weight=1)
+        self.content_frame.grid_rowconfigure(0, weight=1)
+
+        # Tab 1: Downloads
+        self.dl_tab = tk.Frame(self.content_frame, bg=self.bg_color)
+        self.dl_tab.grid(row=0, column=0, sticky="nsew")
+        self._build_dl_tab(self.dl_tab)
+
+        # Tab 2: Transcription
+        self.trans_tab = tk.Frame(self.content_frame, bg=self.bg_color)
+        self.trans_tab.grid(row=0, column=0, sticky="nsew")
+        self._build_trans_tab(self.trans_tab)
+        
+        # Initial State
+        self._switch_tab("dl")
+
+        # Shared Log Area (at the bottom of container)
+        self._build_log_area(container)
+
+    def _switch_tab(self, tab: str) -> None:
+        if tab == "dl":
+            self.dl_tab.tkraise()
+            self.btn_dl_tab.config_state("normal", bg="white")
+            self.btn_dl_tab.text_color = self.accent_color
+            self.btn_dl_tab._draw()
+            
+            self.btn_trans_tab.config_state("normal", bg=self.bg_color)
+            self.btn_trans_tab.text_color = "#86868B"
+            self.btn_trans_tab._draw()
+        else:
+            self.trans_tab.tkraise()
+            self.btn_trans_tab.config_state("normal", bg="white")
+            self.btn_trans_tab.text_color = self.accent_color
+            self.btn_trans_tab._draw()
+            
+            self.btn_dl_tab.config_state("normal", bg=self.bg_color)
+            self.btn_dl_tab.text_color = "#86868B"
+            self.btn_dl_tab._draw()
+
+    def _build_dl_tab(self, parent: tk.Frame) -> None:
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(2, weight=1)
+
+        tk.Label(
+            parent, text="Batch Video Downloader", bg=self.bg_color, fg=self.text_color,
+            font=(self.font_family, 22, "bold"),
+        ).grid(row=0, column=0, sticky="w", pady=(20, 2), padx=10)
+
+        tk.Label(
+            parent, text="Paste Title on line 1, Link on line 2, etc.",
+            bg=self.bg_color, fg="#86868B", font=(self.font_family, 10),
+        ).grid(row=1, column=0, sticky="w", pady=(0, 8), padx=10)
+
+        # Text area with proper border via frame highlight
+        border = tk.Frame(parent, bg="#D2D2D7")
+        border.grid(row=2, column=0, sticky="nsew", pady=(0, 12), padx=10)
+        border.grid_columnconfigure(0, weight=1)
+        border.grid_rowconfigure(0, weight=1)
+
+        inner = tk.Frame(border, bg="white")
+        inner.grid(row=0, column=0, sticky="nsew", padx=1, pady=1)
+        inner.grid_columnconfigure(0, weight=1)
+        inner.grid_rowconfigure(0, weight=1)
+
+        self.dl_input_text = tk.Text(
+            inner, wrap=tk.WORD, font=(self.font_family, 11),
             bg="white", fg=self.text_color, insertbackground=self.accent_color,
-            relief=tk.FLAT, padx=15, pady=15,
+            relief=tk.FLAT, padx=10, pady=10,
         )
-        self.input_text.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
-        scroll = tk.Scrollbar(self.input_frame, command=self.input_text.yview)
-        scroll.pack(fill=tk.Y, side=tk.RIGHT)
-        self.input_text.config(yscrollcommand=scroll.set, state="normal")
+        self.dl_input_text.grid(row=0, column=0, sticky="nsew")
 
+        scroll = tk.Scrollbar(inner, command=self.dl_input_text.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.dl_input_text.config(yscrollcommand=scroll.set)
+        self._bind_context_menu(self.dl_input_text)
+        self.dl_input_frame = border  # keep reference for grid_remove
+
+        self._build_save_row(parent, row=3)
+        self._build_dl_options_row(parent, row=4)
+        self._build_dl_concurrent_row(parent, row=5)
+        self._build_dub_row(parent, row=6)
+        self._build_advanced_row(parent, row=7)
+        self._build_dl_button_row(parent, row=8)
+
+    def _build_trans_tab(self, parent: tk.Frame) -> None:
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(2, weight=1)
+
+        tk.Label(
+            parent, text="Batch Transcription", bg=self.bg_color, fg=self.text_color,
+            font=(self.font_family, 22, "bold"),
+        ).grid(row=0, column=0, sticky="w", pady=(20, 2), padx=10)
+
+        tk.Label(
+            parent, text="Paste Title on line 1, Link on line 2, etc. Output: Title + Link + Text",
+            bg=self.bg_color, fg="#86868B", font=(self.font_family, 10),
+        ).grid(row=1, column=0, sticky="w", pady=(0, 8), padx=10)
+
+        border = tk.Frame(parent, bg="#D2D2D7")
+        border.grid(row=2, column=0, sticky="nsew", pady=(0, 12), padx=10)
+        border.grid_columnconfigure(0, weight=1)
+        border.grid_rowconfigure(0, weight=1)
+
+        inner = tk.Frame(border, bg="white")
+        inner.grid(row=0, column=0, sticky="nsew", padx=1, pady=1)
+        inner.grid_columnconfigure(0, weight=1)
+        inner.grid_rowconfigure(0, weight=1)
+
+        self.trans_input_text = tk.Text(
+            inner, wrap=tk.WORD, font=(self.font_family, 11),
+            bg="white", fg=self.text_color, insertbackground=self.accent_color,
+            relief=tk.FLAT, padx=10, pady=10,
+        )
+        self.trans_input_text.grid(row=0, column=0, sticky="nsew")
+
+        scroll = tk.Scrollbar(inner, command=self.trans_input_text.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.trans_input_text.config(yscrollcommand=scroll.set)
+        self._bind_context_menu(self.trans_input_text)
+
+        # Provider row
+        prov_frame = tk.Frame(parent, bg=self.bg_color)
+        prov_frame.grid(row=3, column=0, sticky="ew", pady=(0, 12), padx=10)
+        self._build_transcription_settings(prov_frame)
+
+        self._build_trans_button_row(parent, row=4)
+
+    def _bind_context_menu(self, widget: tk.Text) -> None:
         menu = tk.Menu(self.root, tearoff=0)
-        menu.add_command(label="Cut", command=lambda: self.input_text.event_generate("<<Cut>>"))
-        menu.add_command(label="Copy", command=lambda: self.input_text.event_generate("<<Copy>>"))
-        menu.add_command(label="Paste", command=lambda: self.input_text.event_generate("<<Paste>>"))
+        menu.add_command(label="Cut", command=lambda: widget.event_generate("<<Cut>>"))
+        menu.add_command(label="Copy", command=lambda: widget.event_generate("<<Copy>>"))
+        menu.add_command(label="Paste", command=lambda: widget.event_generate("<<Paste>>"))
         menu.add_separator()
-        menu.add_command(label="Select All", command=lambda: self.input_text.event_generate("<<SelectAll>>"))
-        self.context_menu = menu
+        menu.add_command(label="Select All", command=lambda: widget.tag_add(tk.SEL, "1.0", tk.END))
+        
+        def show_menu(event):
+            menu.tk_popup(event.x_root, event.y_root)
+        widget.bind("<Button-3>", show_menu)
 
-        def show_context_menu(event):
-            try:
-                menu.tk_popup(event.x_root, event.y_root)
-            finally:
-                menu.grab_release()
+    def _truncate(self, text: str, width: int, font: Tuple) -> str:
+        """Truncate text to fit a pixel width using ellipsis."""
+        import tkinter.font as tkfont
+        f = tkfont.Font(family=font[0], size=font[1])
+        if f.measure(text) <= width:
+            return text
+        
+        for i in range(len(text), 0, -1):
+            if f.measure(text[:i] + "...") <= width:
+                return text[:i] + "..."
+        return "..."
 
-        self.input_text.bind("<Button-3>", show_context_menu)
 
-        shortcuts = {
-            "<Control-a>": "<<SelectAll>>",
-            "<Control-A>": "<<SelectAll>>",
-            "<Control-c>": "<<Copy>>",
-            "<Control-C>": "<<Copy>>",
-            "<Control-v>": "<<Paste>>",
-            "<Control-V>": "<<Paste>>",
-            "<Control-x>": "<<Cut>>",
-            "<Control-X>": "<<Cut>>",
-        }
-        for key, virtual_event in shortcuts.items():
-            if virtual_event == "<<SelectAll>>":
-                self.input_text.bind(
-                    key, lambda e: self.input_text.tag_add(tk.SEL, "1.0", tk.END) or "break"
-                )
-            else:
-                self.input_text.bind(
-                    key, lambda e, ve=virtual_event: self.input_text.event_generate(ve) or "break"
-                )
-
-    def _build_save_row(self) -> None:
-        frame = tk.Frame(self.main_frame, bg=self.bg_color)
-        frame.grid(row=3, column=0, sticky="ew", pady=(0, 15))
+    def _build_save_row(self, parent: tk.Frame, row: int) -> None:
+        frame = tk.Frame(parent, bg=self.bg_color)
+        frame.grid(row=row, column=0, sticky="ew", pady=(0, 10), padx=10)
         frame.grid_columnconfigure(1, weight=1)
 
         tk.Label(
             frame, text="Save to:", bg=self.bg_color, fg=self.text_color,
-            font=(self.font_family, 11, "bold"),
-        ).grid(row=0, column=0, sticky="w", padx=(0, 10))
+            font=(self.font_family, 10, "bold"),
+        ).grid(row=0, column=0, sticky="w", padx=(0, 8))
 
         self.dir_label = tk.Label(
-            frame, text=str(self.downloads_dir), bg=self.bg_color, fg="#555555",
-            font=(self.font_family, 10),
+            frame, text=str(self.downloads_dir), bg=self.bg_color, fg="#5E5CE6",
+            font=(self.font_family, 10), anchor="w",
         )
-        self.dir_label.grid(row=0, column=1, sticky="w")
+        self.dir_label.grid(row=0, column=1, sticky="ew")
+        # Truncate with ellipsis when too narrow
+        self.dir_label.bind("<Configure>", lambda e: self.dir_label.config(
+            text=self._truncate(str(self.downloads_dir), e.width, (self.font_family, 10))
+        ))
 
         self.browse_btn = RoundedButton(
-            frame, text="Browse...", command=self.browse_directory,
-            radius=15, bg_color=self.gray_bg, hover_color=self.gray_hover,
+            frame, text="Browse…", command=self.browse_directory,
+            radius=14, bg_color=self.gray_bg, hover_color=self.gray_hover,
             text_color=self.text_color, font=(self.font_family, 10, "bold"),
-            width=100, height=35,
+            width=90, height=32,
         )
-        self.browse_btn.grid(row=0, column=2, sticky="e")
+        self.browse_btn.grid(row=0, column=2, sticky="e", padx=(6, 0))
 
-    def _build_options_row(self) -> None:
-        frame = tk.Frame(self.main_frame, bg=self.bg_color)
-        frame.grid(row=4, column=0, sticky="ew", pady=(0, 15))
+    def _build_dl_options_row(self, parent: tk.Frame, row: int) -> None:
+        frame = tk.Frame(parent, bg=self.bg_color)
+        frame.grid(row=row, column=0, sticky="ew", pady=(0, 10), padx=10)
 
         tk.Label(
             frame, text="Subtitle Sync Mode:", bg=self.bg_color, fg=self.text_color,
-            font=(self.font_family, 11, "bold"),
-        ).pack(side=tk.LEFT, padx=(0, 10))
+            font=(self.font_family, 10, "bold"),
+        ).pack(side=tk.LEFT, padx=(0, 8))
 
         self.sync_mode_var = tk.StringVar(value="None (2-second intervals)")
         ttk.Combobox(
             frame, textvariable=self.sync_mode_var,
             values=["None (2-second intervals)", "Whisper AI (Smart Sync)"],
-            state="readonly", font=(self.font_family, 10), width=25,
+            state="readonly", font=(self.font_family, 10), width=22,
         ).pack(side=tk.LEFT)
 
-        tk.Frame(frame, bg=self.bg_color, width=20).pack(side=tk.LEFT)
+    def _build_dl_concurrent_row(self, parent: tk.Frame, row: int) -> None:
+        frame = tk.Frame(parent, bg=self.bg_color)
+        frame.grid(row=row, column=0, sticky="ew", pady=(0, 10), padx=10)
 
         self.concurrent_var = tk.BooleanVar(value=self.config.get("concurrent_downloads", False))
-        tk.Checkbutton(
-            frame, text="Simultaneous",
-            variable=self.concurrent_var, bg=self.bg_color, activebackground=self.bg_color,
-            fg=self.text_color, font=(self.font_family, 10),
+        ModernCheckbutton(
+            frame, text="Simultaneous Downloads",
+            variable=self.concurrent_var, bg_color=self.bg_color,
             command=self._save_config,
         ).pack(side=tk.LEFT)
 
         self.max_concurrent_var = tk.IntVar(value=self.config.get("max_concurrent", 5))
+        tk.Label(frame, text="Max:", bg=self.bg_color, fg=self.text_color,
+                 font=(self.font_family, 10)).pack(side=tk.LEFT, padx=(15, 4))
         self.max_concurrent_spin = tk.Spinbox(
             frame, from_=1, to=10, textvariable=self.max_concurrent_var,
             width=3, font=(self.font_family, 10), command=self._save_config,
         )
-        self.max_concurrent_spin.pack(side=tk.LEFT, padx=(5, 0))
+        self.max_concurrent_spin.pack(side=tk.LEFT)
 
-    def _build_dub_row(self) -> None:
-        frame = tk.Frame(self.main_frame, bg=self.bg_color)
-        frame.grid(row=5, column=0, sticky="ew", pady=(0, 15))
+    def _build_dub_row(self, parent: tk.Frame, row: int) -> None:
+        frame = tk.Frame(parent, bg=self.bg_color)
+        frame.grid(row=row, column=0, sticky="ew", pady=(0, 10), padx=10)
         frame.grid_columnconfigure(1, weight=1)
 
         tk.Label(
             frame, text="(Optional) Dub Folder:", bg=self.bg_color, fg=self.text_color,
-            font=(self.font_family, 11, "bold"),
-        ).grid(row=0, column=0, sticky="w", padx=(0, 10))
+            font=(self.font_family, 10, "bold"),
+        ).grid(row=0, column=0, sticky="w", padx=(0, 8))
 
-        dub_label_text = self.dub_dir if self.dub_dir else "Not Selected (Uses Video Audio)"
+        dub_label_text = self.dub_dir if self.dub_dir else "Not Selected"
         self.dub_dir_label = tk.Label(
-            frame, text=dub_label_text, bg=self.bg_color, fg="#555555",
-            font=(self.font_family, 10),
+            frame, text=dub_label_text, bg=self.bg_color, fg="#5E5CE6",
+            font=(self.font_family, 10), anchor="w",
         )
-        self.dub_dir_label.grid(row=0, column=1, sticky="w")
+        self.dub_dir_label.grid(row=0, column=1, sticky="ew")
+        self.dub_dir_label.bind("<Configure>", lambda e: self.dub_dir_label.config(
+            text=self._truncate(self.dub_dir or "Not Selected", e.width, (self.font_family, 10))
+        ))
 
         self.dub_browse_btn = RoundedButton(
-            frame, text="Browse...", command=self.browse_dub_directory,
-            radius=15, bg_color=self.gray_bg, hover_color=self.gray_hover,
+            frame, text="Browse…", command=self.browse_dub_directory,
+            radius=14, bg_color=self.gray_bg, hover_color=self.gray_hover,
             text_color=self.text_color, font=(self.font_family, 10, "bold"),
-            width=100, height=35,
+            width=90, height=32,
         )
-        self.dub_browse_btn.grid(row=0, column=2, sticky="e")
+        self.dub_browse_btn.grid(row=0, column=2, sticky="e", padx=(6, 0))
 
-    def _build_advanced_row(self) -> None:
-        frame = tk.Frame(self.main_frame, bg=self.bg_color)
-        frame.grid(row=6, column=0, sticky="ew", pady=(0, 15))
+
+    def _build_advanced_row(self, parent: tk.Frame, row: int) -> None:
+        frame = tk.Frame(parent, bg=self.bg_color)
+        frame.grid(row=row, column=0, sticky="ew", pady=(0, 10), padx=10)
 
         self.use_browser_cookies = tk.BooleanVar(value=self.config.get("use_browser_cookies", False))
-        tk.Checkbutton(
+        ModernCheckbutton(
             frame, text="Use Chrome Cookies (as fallback)",
-            variable=self.use_browser_cookies, bg=self.bg_color, activebackground=self.bg_color,
-            fg=self.text_color, font=(self.font_family, 10),
+            variable=self.use_browser_cookies, bg_color=self.bg_color,
             command=self._save_config,
         ).pack(side=tk.LEFT)
 
-        tk.Button(
-            frame, text="Clear local cookies.txt", font=(self.font_family, 9),
-            command=self.clear_local_cookies, bg=self.gray_bg, relief=tk.FLAT,
+        RoundedButton(
+            frame, text="Clear Cookies", command=self.clear_local_cookies,
+            radius=12, bg_color=self.gray_bg, hover_color=self.gray_hover,
+            text_color=self.text_color, font=(self.font_family, 9), width=110, height=30,
         ).pack(side=tk.RIGHT)
 
-    def _build_button_row(self) -> None:
-        frame = tk.Frame(self.main_frame, bg=self.bg_color)
-        frame.grid(row=7, column=0, sticky="ew", pady=(0, 20))
+    def _build_transcription_settings(self, parent: tk.Frame) -> None:
+        tk.Label(
+            parent, text="Transcription Provider:", bg=self.bg_color, fg=self.text_color,
+            font=(self.font_family, 11, "bold"),
+        ).pack(side=tk.LEFT, padx=(0, 10))
+
+        self.trans_provider_var = tk.StringVar(value=self.config.get("transcription_provider", "Local Whisper"))
+        ttk.Combobox(
+            parent, textvariable=self.trans_provider_var,
+            values=["Local Whisper", "Groq AI (Fastest)"],
+            state="readonly", font=(self.font_family, 10), width=20,
+        ).pack(side=tk.LEFT)
+
+        tk.Label(
+            parent, text="Groq Key:", bg=self.bg_color, fg=self.text_color,
+            font=(self.font_family, 10),
+        ).pack(side=tk.LEFT, padx=(15, 5))
+
+        self.groq_key_var = tk.StringVar(value=self.config.get("groq_api_key", ""))
+        self.groq_key_entry = RoundedEntry(
+            parent, variable=self.groq_key_var, show="*",
+            width=180, radius=15, bg_color="white",
+        )
+        self.groq_key_entry.pack(side=tk.LEFT)
+        self.groq_key_entry.entry.bind("<FocusOut>", lambda e: self._save_config())
+
+    def _build_dl_button_row(self, parent: tk.Frame, row: int) -> None:
+        frame = tk.Frame(parent, bg=self.bg_color)
+        frame.grid(row=row, column=0, sticky="ew", pady=(8, 16), padx=10)
         frame.grid_columnconfigure(0, weight=1)
         frame.grid_columnconfigure(1, weight=1)
 
         self.download_btn = RoundedButton(
-            frame, text="Start Download", command=self.start_download,
-            radius=20, bg_color=self.accent_color, hover_color=self.accent_hover,
-            text_color="white", font=(self.font_family, 13, "bold"), height=50,
+            frame, text="⬇  Start Batch Download", command=self.start_download,
+            radius=22, bg_color=self.accent_color, hover_color=self.accent_hover,
+            text_color="white", font=(self.font_family, 12, "bold"), height=46,
         )
-        self.download_btn.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        self.download_btn.grid(row=0, column=0, sticky="ew", padx=(0, 8))
 
         self.cancel_btn = RoundedButton(
             frame, text="Cancel", command=self.cancel_download,
-            radius=20, bg_color="#FF3B30", hover_color="#D70A01",
-            text_color="white", font=(self.font_family, 13, "bold"), height=50,
+            radius=22, bg_color="#FF3B30", hover_color="#D70A01",
+            text_color="white", font=(self.font_family, 12, "bold"), height=46,
         )
         self.cancel_btn.grid(row=0, column=1, sticky="ew")
         self.cancel_btn.config_state("disabled", bg="#E5E5EA")
 
-    def _build_log_area(self) -> None:
-        frame = tk.Frame(
-            self.main_frame, bg="#1D1D1F",
-            highlightbackground="#D2D2D7", highlightthickness=1,
+    def _build_trans_button_row(self, parent: tk.Frame, row: int) -> None:
+        frame = tk.Frame(parent, bg=self.bg_color)
+        frame.grid(row=row, column=0, sticky="ew", pady=(8, 16), padx=10)
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_columnconfigure(1, weight=1)
+
+        self.trans_btn = RoundedButton(
+            frame, text="🎙  Start Transcription", command=self.start_transcription,
+            radius=22, bg_color=self.accent_color, hover_color=self.accent_hover,
+            text_color="white", font=(self.font_family, 12, "bold"), height=46,
         )
-        frame.grid(row=8, column=0, sticky="ew")
+        self.trans_btn.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+
+        self.trans_cancel_btn = RoundedButton(
+            frame, text="Cancel", command=self.cancel_download,
+            radius=22, bg_color="#FF3B30", hover_color="#D70A01",
+            text_color="white", font=(self.font_family, 12, "bold"), height=46,
+        )
+        self.trans_cancel_btn.grid(row=0, column=1, sticky="ew")
+        self.trans_cancel_btn.config_state("disabled", bg="#E5E5EA")
+
+    def _build_log_area(self, parent: tk.Frame) -> None:
+        # Dark terminal log box with rounded border simulation
+        outer = tk.Frame(parent, bg="#3A3A3C", pady=2, padx=2)
+        outer.grid(row=10, column=0, sticky="ew", pady=(12, 0), padx=0)
+        outer.grid_columnconfigure(0, weight=1)
+        outer.grid_rowconfigure(0, weight=1)
+
+        log_inner = tk.Frame(outer, bg="#1D1D1F")
+        log_inner.grid(row=0, column=0, sticky="nsew")
+        log_inner.grid_columnconfigure(0, weight=1)
+        log_inner.grid_rowconfigure(0, weight=1)
 
         self.log_text = tk.Text(
-            frame, wrap=tk.WORD, height=7, font=("Consolas", 10),
-            bg="#1D1D1F", fg="#F5F5F7", insertbackground="#1D1D1F",
-            relief=tk.FLAT, padx=12, pady=12, state="disabled",
+            log_inner, wrap=tk.WORD, height=7, font=("Consolas", 10),
+            bg="#1D1D1F", fg="#A8FF78", insertbackground="#1D1D1F",
+            relief=tk.FLAT, padx=12, pady=10, state="disabled",
         )
-        self.log_text.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
-        scroll = tk.Scrollbar(frame, command=self.log_text.yview)
-        scroll.pack(fill=tk.Y, side=tk.RIGHT)
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+
+        scroll = tk.Scrollbar(log_inner, command=self.log_text.yview, bg="#2C2C2E")
+        scroll.grid(row=0, column=1, sticky="ns")
         self.log_text.config(yscrollcommand=scroll.set)
 
     # ------------------------------------------------------------------
@@ -298,9 +484,11 @@ class AppleStyleApp:
     def _save_config(self) -> None:
         self.config.set("downloads_dir", str(self.downloads_dir))
         self.config.set("dub_dir", self.dub_dir)
-        self.config.set("use_browser_cookies", self.use_browser_cookies.get())
         self.config.set("concurrent_downloads", self.concurrent_var.get())
         self.config.set("max_concurrent", self.max_concurrent_var.get())
+        self.config.set("use_browser_cookies", self.use_browser_cookies.get())
+        self.config.set("transcription_provider", self.trans_provider_var.get())
+        self.config.set("groq_api_key", self.groq_key_var.get())
         self.config.save()
 
     def browse_directory(self) -> None:
@@ -382,6 +570,30 @@ class AppleStyleApp:
                 0, messagebox.showerror, "Setup Error",
                 f"Failed to download dependencies: {e}\n\nPlease install them manually.",
             )
+
+    @staticmethod
+    def _is_url(line: str) -> bool:
+        return line.lower().startswith(URL_PREFIXES)
+
+    def _parse_input(self, lines: Sequence[str]):
+        titles: List[str] = []
+        links: List[str] = []
+        subtitles_list: List[List[str]] = []
+
+        link_indices: List[int] = []
+        for i, line in enumerate(lines):
+            if self._is_url(line) and i > 0 and not self._is_url(lines[i - 1]):
+                link_indices.append(i)
+
+        for idx_pos, link_idx in enumerate(link_indices):
+            titles.append(lines[link_idx - 1])
+            links.append(lines[link_idx])
+
+            start = link_idx + 1
+            end = link_indices[idx_pos + 1] - 1 if idx_pos + 1 < len(link_indices) else len(lines)
+            subtitles_list.append(list(lines[start:end]))
+
+        return titles, links, subtitles_list
 
     # ------------------------------------------------------------------
     # Cancellation / state
@@ -484,13 +696,62 @@ class AppleStyleApp:
                 self.download_manager.set_item_status(index, "Skipped", "#34C759")
             self.log(f"-> Item marked as skipped: {index + 1}")
 
-    def start_download(self) -> None:
-        with self._state_lock:
-            if self.downloading:
+    def _handle_transcribe_item(self, index: int) -> None:
+        """Triggered by the 'Transcribe' button in the UI."""
+        if not hasattr(self, "_download_items") or index >= len(self._download_items):
+            return
+            
+        title, link, subs = self._download_items[index]
+        provider = self.trans_provider_var.get()
+        api_key = self.groq_key_var.get()
+        
+        def _worker():
+            self.root.after(0, self.download_manager.set_item_status, index, "Transcribing...", "#FF9500")
+            
+            safe_title = sanitize_filename(title)
+            srt_path = self.downloads_dir / f"{safe_title} (SRT).srt"
+            
+            audio_source = self._get_dub_track(title)
+            if not audio_source:
+                video_path = self.downloads_dir / f"{safe_title}.mp4"
+                if video_path.exists():
+                    audio_source = str(video_path)
+            
+            if not audio_source:
+                self.log(f"[!] Error: Could not find video/audio for transcription of '{title}'")
+                self.root.after(0, self.download_manager.set_item_status, index, "Failed (No File)", "#FF3B30")
                 return
 
-        raw_input = self.input_text.get("1.0", tk.END).strip()
-        lines = [line.strip() for line in raw_input.split("\n") if line.strip()]
+            success = False
+            if provider == "Groq AI (Fastest)":
+                transcriber = GroqTranscriber(self.log, api_key)
+                success = transcriber.transcribe(audio_source, srt_path, is_cancelled=self._is_cancelled)
+            else:
+                aligner = WhisperAligner.try_create(self.log)
+                if aligner:
+                    success = aligner.transcribe(audio_source, srt_path, is_cancelled=self._is_cancelled)
+                else:
+                    self.log("[!] Error: Local Whisper is not available.")
+
+            status = "Finished" if success else "Finished (Transcribe Failed)"
+            color = "#34C759" if success else "#FF3B30"
+            self.root.after(0, self.download_manager.set_item_status, index, status, color)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def start_download(self) -> None:
+        if self.downloading:
+            # If we're showing the "Finish & Return" button, reset
+            if self.download_btn.text == "Finish & Return":
+                if self.download_manager:
+                    self.download_manager.destroy()
+                    self.download_manager = None
+                self.dl_input_frame.grid()
+                self.reset_ui()
+            return
+
+        text = self.dl_input_text.get("1.0", tk.END).strip()
+        lines = [line.strip() for line in text.split("\n") if line.strip()]
         if not lines:
             messagebox.showwarning("Input Error", "Please enter at least one title and one link.")
             return
@@ -539,7 +800,7 @@ class AppleStyleApp:
         self.log_text.config(state="disabled")
 
         self.log(f"Starting batch download for {len(titles)} items...")
-        self.input_text.config(state="disabled", bg="#F5F5F7")
+        self.dl_input_text.config(state="disabled", bg="#F5F5F7")
 
         sync_mode = self.sync_mode_var.get()
         self.cancelled_indices = set()
@@ -559,12 +820,13 @@ class AppleStyleApp:
         self._download_items = list(zip(titles, links, subtitles_list))
 
         # Hide input, show manager
-        self.input_frame.grid_remove()
+        self.dl_input_frame.grid_remove()
         self.download_manager = DownloadManager(
-            self.main_frame, titles,
+            self.dl_tab, titles,
             self._cancel_single_item,
             self._manual_retry_item,
             self._skip_item,
+            self._handle_transcribe_item,
             self.bg_color, self.text_color, self.accent_color, self.font_family
         )
         self.download_manager.grid(row=2, column=0, sticky="nsew", pady=(0, 15))
@@ -824,7 +1086,7 @@ class AppleStyleApp:
                 if self.download_manager:
                     self.root.after(0, self.download_manager.destroy)
                     self.download_manager = None
-                self.input_frame.grid()
+                self.dl_input_frame.grid()
                 self.root.after(0, self.reset_ui)
 
     def _save_batch_links(self, titles: Sequence[str], links: Sequence[str]) -> None:
@@ -865,7 +1127,13 @@ class AppleStyleApp:
             if self._is_cancelled():
                 return
 
+            # 1. Determine audio source (Dub folder > Downloaded Video)
             audio_source = self._get_dub_track(title)
+            if not audio_source:
+                video_path = self.downloads_dir / f"{safe_title}.mp4"
+                if video_path.exists():
+                    audio_source = str(video_path)
+
             if audio_source:
                 self.log("-> Starting Whisper Smart Sync... (This may take a minute)")
                 try:
@@ -875,12 +1143,11 @@ class AppleStyleApp:
                 except Exception as e:
                     logger.exception("Whisper sync failed for %s", title)
                     self.log(f"-> Error with Whisper Sync: {e}")
-                    err_msg = f"Whisper Error for '{title}': {e}"
                     with self.errors_lock:
-                        self.batch_errors.append(err_msg)
+                        self.batch_errors.append(f"Whisper Sync Error for '{title}': {e}")
                     self.log("-> Falling back to 2-second timestamps...")
             else:
-                self.log("-> No matching dub found in folder. Falling back to 2-second timestamps.")
+                self.log("-> No matching audio found for sync. Falling back to 2-second timestamps.")
 
         if not whisper_success and not self._is_cancelled():
             generate_standard_srt(subs, srt_path, self.log)
@@ -897,15 +1164,208 @@ class AppleStyleApp:
         return None
 
     # ------------------------------------------------------------------
+    # Transcription Tab Logic
+    # ------------------------------------------------------------------
+
+    def start_transcription(self) -> None:
+        """Called by the Start button on the Transcription tab."""
+        if self.downloading:
+            return
+
+        text = self.trans_input_text.get("1.0", tk.END).strip()
+        if not text:
+            self.log("[!] No links provided in the transcription tab.")
+            return
+
+        titles, links = parse_titles_and_links(text)
+        if not links:
+            self.log("[!] Could not find any valid links in the input.")
+            return
+
+        self.downloading = True
+        self.cancelled = False
+        self.batch_errors = []
+        
+        self.trans_btn.config_state("disabled", text="Transcribing...", bg="#E5E5EA")
+        self.trans_cancel_btn.config_state("normal", bg="#FF3B30")
+        
+        # We reuse the log area and maybe the download manager if we want, 
+        # but for simplicity, let's just log progress for now.
+        # If the user wants a manager for transcription too, we can add it later.
+        
+        thread = threading.Thread(
+            target=self._transcribe_batch_worker,
+            args=(titles, links),
+            daemon=True
+        )
+        thread.start()
+
+    def on_transcribe_item(self, index: int) -> None:
+        """Called by the Transcribe button in the Download Manager."""
+        if not self.download_manager or not hasattr(self, "_download_items"):
+            return
+            
+        item = self.download_manager.items[index]
+        title = item.title
+        # Get link from stored download items
+        link = self._download_items[index][1] if index < len(self._download_items) else "Unknown Link"
+        
+        # For single items from the download list, we'll try to find the downloaded video or dub
+        self.root.after(0, self.download_manager.set_item_status, index, "Transcribing...", "#FF9500")
+        
+        thread = threading.Thread(
+            target=self._transcribe_single_worker,
+            args=(index, title, link),
+            daemon=True
+        )
+        thread.start()
+
+    def _transcribe_batch_worker(self, titles: List[str], links: List[str]) -> None:
+        self.log(f"\n--- Starting Batch Transcription ({len(links)} items) ---")
+        
+        provider = self.trans_provider_var.get()
+        transcriber = None
+        if provider == "Groq AI (Fastest)":
+            key = self.groq_key_var.get()
+            if not key:
+                self.log("[!] Error: Groq API Key is missing.")
+                self.root.after(0, self.reset_ui)
+                return
+            transcriber = GroqTranscriber(self.log, key)
+        else:
+            transcriber = WhisperAligner.try_create(self.log)
+            
+        if not transcriber:
+            self.log("[!] Failed to initialize transcription provider.")
+            self.root.after(0, self.reset_ui)
+            return
+
+        for i, (title, link) in enumerate(zip(titles, links)):
+            if self._is_cancelled():
+                break
+                
+            self.log(f"\n[{i+1}/{len(links)}] Transcribing: {title}")
+            
+            # 1. Extract audio
+            audio_path = self._extract_audio_only(title, link)
+            if not audio_path:
+                self.log(f"-> Failed to extract audio for: {title}")
+                continue
+                
+            # 2. Transcribe
+            transcript = transcriber.transcribe_to_text(audio_path, is_cancelled=self._is_cancelled)
+            
+            # 3. Save report
+            if transcript:
+                self._save_transcription_report(title, link, transcript)
+                self.log(f"-> Report saved for: {title}")
+            else:
+                self.log(f"-> Transcription failed or cancelled for: {title}")
+                
+            # Cleanup temp audio
+            if os.path.exists(audio_path):
+                try: os.remove(audio_path)
+                except: pass
+
+        self.log("\n--- Batch Transcription Complete ---")
+        self.root.after(0, self.reset_ui)
+
+    def _transcribe_single_worker(self, index: int, title: str, link: str) -> None:
+        # Similar logic but updates the DownloadManager status
+        provider = self.trans_provider_var.get()
+        transcriber = None
+        if provider == "Groq AI (Fastest)":
+            transcriber = GroqTranscriber(self.log, self.groq_key_var.get())
+        else:
+            transcriber = WhisperAligner.try_create(self.log)
+            
+        if not transcriber:
+            self.root.after(0, self.download_manager.set_item_status, index, "Failed", "#FF3B30")
+            return
+
+        # Try to find existing audio/video first
+        audio_source = self._get_dub_track(title)
+        if not audio_source:
+            video_path = self.downloads_dir / f"{sanitize_filename(title)}.mp4"
+            if video_path.exists():
+                audio_source = str(video_path)
+        
+        # If no local file, we have to download audio (though usually single transcribe is called after download)
+        temp_audio = None
+        if not audio_source:
+            self.log(f"-> No local file found for {title}, extracting audio from link...")
+            audio_source = self._extract_audio_only(title, link)
+            temp_audio = audio_source
+
+        if not audio_source:
+            self.root.after(0, self.download_manager.set_item_status, index, "No Audio", "#FF3B30")
+            return
+
+        transcript = transcriber.transcribe_to_text(audio_source, is_cancelled=self._is_cancelled)
+        
+        if transcript:
+            self._save_transcription_report(title, link, transcript)
+            self.root.after(0, self.download_manager.set_item_status, index, "Transcript Saved", "#34C759")
+        else:
+            self.root.after(0, self.download_manager.set_item_status, index, "Failed", "#FF3B30")
+
+        if temp_audio and os.path.exists(temp_audio):
+            try: os.remove(temp_audio)
+            except: pass
+
+    def _extract_audio_only(self, title: str, link: str) -> Optional[str]:
+        """Extracts mono audio to a temp file for transcription."""
+        safe_title = sanitize_filename(title)
+        output_path = self.downloads_dir / f"{safe_title}_audio.mp3"
+        
+        # yt-dlp command to just get audio
+        cmd = [
+            "yt-dlp",
+            "-x", "--audio-format", "mp3",
+            "--audio-quality", "0",
+            "-o", str(output_path),
+            link
+        ]
+        
+        if self.use_browser_cookies.get():
+            cmd.extend(["--cookies-from-browser", "chrome"])
+            
+        self.log(f"-> Extracting audio...")
+        return_code = self._run_yt_dlp(-1, cmd) # -1 index means no manager item
+        
+        if return_code == 0 and output_path.exists():
+            return str(output_path)
+        return None
+
+    def _save_transcription_report(self, title: str, link: str, transcript: str) -> None:
+        safe_title = sanitize_filename(title)
+        report_path = self.downloads_dir / f"{safe_title} (Transcript).txt"
+        try:
+            with report_path.open("w", encoding="utf-8") as f:
+                f.write(f"TITLE: {title}\n")
+                f.write(f"LINK: {link}\n")
+                f.write("-" * 40 + "\n\n")
+                f.write(transcript)
+        except OSError as e:
+            self.log(f"[!] Error saving report: {e}")
+
+    # ------------------------------------------------------------------
     # UI reset
     # ------------------------------------------------------------------
     def reset_ui(self) -> None:
         with self._state_lock:
             self.downloading = False
-        self.download_btn.config_state("normal", text="Start Download", bg=self.accent_color)
+        
+        # Reset Download Tab Buttons
+        self.download_btn.config_state("normal", text="Start Batch Download", bg=self.accent_color)
         self.cancel_btn.config_state("disabled", bg="#E5E5EA")
         self.browse_btn.config_state("normal", bg=self.gray_bg)
-        self.input_text.config(state="normal", bg="white")
+        self.dl_input_text.config(state="normal", bg="white")
+        
+        # Reset Transcription Tab Buttons
+        self.trans_btn.config_state("normal", text="Start Batch Transcription", bg=self.accent_color)
+        self.trans_cancel_btn.config_state("disabled", bg="#E5E5EA")
+        self.trans_input_text.config(state="normal", bg="white")
 
 
 def _enable_dpi_awareness() -> None:

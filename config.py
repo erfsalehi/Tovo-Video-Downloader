@@ -15,6 +15,8 @@ DEFAULTS: dict[str, Any] = {
     "use_browser_cookies": False,
     "concurrent_downloads": False,
     "max_concurrent": 5,
+    "groq_api_key": "",
+    "transcription_provider": "Local Whisper",
 }
 
 
