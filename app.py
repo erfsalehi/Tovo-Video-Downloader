@@ -244,6 +244,7 @@ class AppleStyleApp:
         scroll.grid(row=0, column=1, sticky="ns")
         self.trans_input_text.config(yscrollcommand=scroll.set)
         self._bind_context_menu(self.trans_input_text)
+        self.trans_border = border # Reference to hide it later
 
         # Provider row
         prov_frame = tk.Frame(parent, bg=self.bg_color)
@@ -1150,6 +1151,12 @@ class AppleStyleApp:
                 self.log("-> No matching audio found for sync. Falling back to 2-second timestamps.")
 
         if not whisper_success and not self._is_cancelled():
+            def progress_fallback(curr, total):
+                if self.download_manager:
+                    # aligner doesn't have a clean way to report progress for standard SRT
+                    # but we can just set it to 50% while "Generating..."
+                    self.root.after(0, self.download_manager.update_item_progress, -2, (curr/total)*100) # -2 as dummy if needed
+
             generate_standard_srt(subs, srt_path, self.log)
 
     def _get_dub_track(self, title: str) -> Optional[str]:
@@ -1189,9 +1196,22 @@ class AppleStyleApp:
         self.trans_btn.config_state("disabled", text="Transcribing...", bg="#E5E5EA")
         self.trans_cancel_btn.config_state("normal", bg="#FF3B30")
         
-        # We reuse the log area and maybe the download manager if we want, 
-        # but for simplicity, let's just log progress for now.
-        # If the user wants a manager for transcription too, we can add it later.
+        # Hide input, show manager in transcription tab
+        self.trans_input_text.grid_remove() # Note: trans_input_frame is not a thing yet, let's check UI structure
+        # Wait, I need to make sure the input area can be hidden. 
+        # In _build_trans_tab, it's 'border'. I should save a reference to it.
+        if hasattr(self, "trans_border"):
+            self.trans_border.grid_remove()
+
+        self.trans_manager = DownloadManager(
+            self.trans_tab, titles,
+            self._cancel_single_item, # Reuse cancellation
+            None, # No retry for now in batch trans
+            None, # No skip
+            None, # No individual transcribe btn
+            self.bg_color, self.text_color, self.accent_color, self.font_family
+        )
+        self.trans_manager.grid(row=2, column=0, sticky="nsew", pady=(0, 15))
         
         thread = threading.Thread(
             target=self._transcribe_batch_worker,
@@ -1224,51 +1244,88 @@ class AppleStyleApp:
         self.log(f"\n--- Starting Batch Transcription ({len(links)} items) ---")
         
         provider = self.trans_provider_var.get()
+        concurrent_mode = self.concurrent_var.get()
+        max_workers = self.max_concurrent_var.get() if concurrent_mode else 1
+        
+        all_results = []
+        results_lock = threading.Lock()
+        
         transcriber = None
         if provider == "Groq AI (Fastest)":
-            key = self.groq_key_var.get()
-            if not key:
-                self.log("[!] Error: Groq API Key is missing.")
-                self.root.after(0, self.reset_ui)
-                return
-            transcriber = GroqTranscriber(self.log, key)
+            transcriber = GroqTranscriber(self.log, self.groq_key_var.get())
         else:
             transcriber = WhisperAligner.try_create(self.log)
-            
+
         if not transcriber:
             self.log("[!] Failed to initialize transcription provider.")
             self.root.after(0, self.reset_ui)
             return
 
-        for i, (title, link) in enumerate(zip(titles, links)):
+        def _item_task(index: int, title: str, link: str):
             if self._is_cancelled():
-                break
-                
-            self.log(f"\n[{i+1}/{len(links)}] Transcribing: {title}")
+                return
+            
+            self.root.after(0, self.trans_manager.set_item_status, index, "Active", self.accent_color)
             
             # 1. Extract audio
-            audio_path = self._extract_audio_only(title, link)
+            audio_path = self._extract_audio_only(title, link, index)
             if not audio_path:
                 self.log(f"-> Failed to extract audio for: {title}")
-                continue
-                
+                self.root.after(0, self.trans_manager.set_item_status, index, "Failed (Audio)", "#FF3B30")
+                return
+
             # 2. Transcribe
-            transcript = transcriber.transcribe_to_text(audio_path, is_cancelled=self._is_cancelled)
+            self.log(f"-> Transcribing: {title}")
             
-            # 3. Save report
+            def progress_cb(curr, total):
+                if total > 0:
+                    percent = (curr / total) * 100
+                    self.root.after(0, self.trans_manager.update_item_progress, index, percent)
+
+            transcript = transcriber.transcribe_to_text(
+                audio_path, is_cancelled=self._is_cancelled, progress_callback=progress_cb
+            )
+            
             if transcript:
-                self._save_transcription_report(title, link, transcript)
-                self.log(f"-> Report saved for: {title}")
+                with results_lock:
+                    all_results.append((title, link, transcript))
+                self.root.after(0, self.trans_manager.set_item_status, index, "Finished", "#34C759")
             else:
-                self.log(f"-> Transcription failed or cancelled for: {title}")
+                self.root.after(0, self.trans_manager.set_item_status, index, "Failed", "#FF3B30")
                 
             # Cleanup temp audio
             if os.path.exists(audio_path):
                 try: os.remove(audio_path)
                 except: pass
 
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_item_task, i, title, link) for i, (title, link) in enumerate(zip(titles, links))]
+            for future in futures:
+                future.result()
+
+        # 3. Save combined report
+        if all_results and not self._is_cancelled():
+            self._save_combined_transcription_report(all_results)
+            self.log(f"\n--- Combined Report Saved for {len(all_results)} items ---")
+        
         self.log("\n--- Batch Transcription Complete ---")
         self.root.after(0, self.reset_ui)
+
+    def _save_combined_transcription_report(self, results: List[Tuple[str, str, str]]) -> None:
+        report_path = self.downloads_dir / "All_Transcriptions.txt"
+        try:
+            with report_path.open("w", encoding="utf-8") as f:
+                f.write("--- BATCH TRANSCRIPTION REPORT ---\n")
+                f.write(f"Generated on: {os.path.basename(str(report_path))}\n\n")
+                for title, link, transcript in results:
+                    f.write(f"TITLE: {title}\n")
+                    f.write(f"LINK: {link}\n")
+                    f.write("-" * 20 + "\n")
+                    f.write(transcript.strip())
+                    f.write("\n\n" + "=" * 60 + "\n\n")
+            self.log(f"-> Combined report saved to: {report_path.name}")
+        except OSError as e:
+            self.log(f"[!] Error saving combined report: {e}")
 
     def _transcribe_single_worker(self, index: int, title: str, link: str) -> None:
         # Similar logic but updates the DownloadManager status
@@ -1301,9 +1358,20 @@ class AppleStyleApp:
             self.root.after(0, self.download_manager.set_item_status, index, "No Audio", "#FF3B30")
             return
 
-        transcript = transcriber.transcribe_to_text(audio_source, is_cancelled=self._is_cancelled)
+        def progress_cb(curr, total):
+            if total > 0:
+                percent = (curr / total) * 100
+                self.root.after(0, self.download_manager.update_item_progress, index, percent)
+
+        transcript = transcriber.transcribe_to_text(
+            audio_source, is_cancelled=self._is_cancelled, progress_callback=progress_cb
+        )
         
         if transcript:
+            # For single items from download tab, we still save individual reports but could also append?
+            # User said "all the transcriptions in 1 text file" for batch. 
+            # For single item click, I'll keep it individual or also save to the combined one?
+            # Let's keep single individual for now as it's a different trigger.
             self._save_transcription_report(title, link, transcript)
             self.root.after(0, self.download_manager.set_item_status, index, "Transcript Saved", "#34C759")
         else:
@@ -1313,7 +1381,7 @@ class AppleStyleApp:
             try: os.remove(temp_audio)
             except: pass
 
-    def _extract_audio_only(self, title: str, link: str) -> Optional[str]:
+    def _extract_audio_only(self, title: str, link: str, index: int = -1) -> Optional[str]:
         """Extracts mono audio to a temp file for transcription."""
         safe_title = sanitize_filename(title)
         output_path = self.downloads_dir / f"{safe_title}_audio.mp3"
@@ -1330,8 +1398,15 @@ class AppleStyleApp:
         if self.use_browser_cookies.get():
             cmd.extend(["--cookies-from-browser", "chrome"])
             
-        self.log(f"-> Extracting audio...")
-        return_code = self._run_yt_dlp(-1, cmd) # -1 index means no manager item
+        self.log(f"-> Extracting audio for {title}...")
+        
+        def audio_progress(p):
+            if index >= 0 and hasattr(self, "trans_manager") and self.trans_manager:
+                self.root.after(0, self.trans_manager.update_item_progress, index, p * 0.1) # 0-10% for audio extract
+            elif index >= 0 and self.download_manager:
+                self.root.after(0, self.download_manager.update_item_progress, index, p * 0.1)
+
+        return_code = self._run_yt_dlp(index, cmd, progress_callback=audio_progress)
         
         if return_code == 0 and output_path.exists():
             return str(output_path)
@@ -1363,8 +1438,13 @@ class AppleStyleApp:
         self.dl_input_text.config(state="normal", bg="white")
         
         # Reset Transcription Tab Buttons
-        self.trans_btn.config_state("normal", text="Start Batch Transcription", bg=self.accent_color)
+        self.trans_btn.config_state("normal", text="🎙  Start Transcription", bg=self.accent_color)
         self.trans_cancel_btn.config_state("disabled", bg="#E5E5EA")
+        if hasattr(self, "trans_border"):
+            self.trans_border.grid()
+        if hasattr(self, "trans_manager") and self.trans_manager:
+            self.trans_manager.destroy()
+            self.trans_manager = None
         self.trans_input_text.config(state="normal", bg="white")
 
 

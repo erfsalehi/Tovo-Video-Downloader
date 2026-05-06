@@ -32,3 +32,8 @@ errors.txt
 # IDE files
 .vscode/
 .idea/
+
+# Scratch and Tests
+scratch/
+test.srt
+test_whisper_*.py

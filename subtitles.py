@@ -13,6 +13,8 @@ logger = logging.getLogger(__name__)
 
 LogFn = Callable[[str], None]
 CancelFn = Callable[[], bool]
+# ProgressCallback: (current_seconds, total_seconds)
+ProgressFn = Callable[[float, float], None]
 
 UNALIGNED_INTERVAL = 2.0
 WHISPER_SAMPLE_RATE = 16000
@@ -85,6 +87,7 @@ class WhisperAligner:
         self,
         audio_source: str,
         is_cancelled: CancelFn = lambda: False,
+        progress_callback: Optional[ProgressFn] = None,
     ) -> Optional[str]:
         """Transcribe ``audio_source`` and return the full text transcript."""
         if is_cancelled():
@@ -95,7 +98,11 @@ class WhisperAligner:
             return None
         self.log("-> Transcribing audio with Whisper AI (Full Transcript)...")
         
-        result = model.transcribe(audio_source)
+        # stable-whisper supports progress_callback
+        result = model.transcribe(
+            audio_source,
+            progress_callback=progress_callback
+        )
 
         if is_cancelled():
             return None
@@ -112,6 +119,7 @@ class WhisperAligner:
         srt_path: Path,
         is_cancelled: CancelFn = lambda: False,
         unaligned_interval: float = UNALIGNED_INTERVAL,
+        progress_callback: Optional[ProgressFn] = None,
     ) -> bool:
         """Align ``subs`` to ``audio_source`` and write an SRT file.
 
@@ -141,7 +149,10 @@ class WhisperAligner:
         if is_cancelled():
             return False
         self.log(f"-> Syncing {len(valid_subs)} lines...")
-        result = model.align(audio_source, text_to_align, detected_lang)
+        result = model.align(
+            audio_source, text_to_align, detected_lang,
+            progress_callback=progress_callback
+        )
 
         all_words: List = []
         for s in result.segments:
@@ -218,6 +229,7 @@ class GroqTranscriber:
         self,
         audio_path: str,
         is_cancelled: CancelFn = lambda: False,
+        progress_callback: Optional[ProgressFn] = None,
     ) -> Optional[str]:
         if not self.api_key:
             self.log("[!] Error: Groq API Key is missing in settings.")
@@ -240,6 +252,9 @@ class GroqTranscriber:
             if is_cancelled():
                 return None
             self.log("-> Uploading to Groq AI (Whisper-large-v3)...")
+            
+            if progress_callback:
+                progress_callback(50, 100) # Mock 50% for upload started
 
             with open(temp_audio, "rb") as f:
                 files = {"file": (os.path.basename(temp_audio), f, "audio/mpeg")}
@@ -253,6 +268,9 @@ class GroqTranscriber:
             if response.status_code != 200:
                 self.log(f"[!] Groq API Error: {response.status_code} - {response.text}")
                 return None
+
+            if progress_callback:
+                progress_callback(100, 100) # Mock 100% for completed
 
             self.log("-> Groq transcription successful!")
             return response.text
