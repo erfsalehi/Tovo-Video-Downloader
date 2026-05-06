@@ -1205,10 +1205,10 @@ class AppleStyleApp:
 
         self.trans_manager = DownloadManager(
             self.trans_tab, titles,
-            self._cancel_single_item, # Reuse cancellation
-            None, # No retry for now in batch trans
-            None, # No skip
-            None, # No individual transcribe btn
+            self._cancel_single_item, 
+            self._trans_retry_item, # New retry callback
+            self._trans_skip_item,  # New skip callback
+            None, 
             self.bg_color, self.text_color, self.accent_color, self.font_family
         )
         self.trans_manager.grid(row=2, column=0, sticky="nsew", pady=(0, 15))
@@ -1240,14 +1240,92 @@ class AppleStyleApp:
         )
         thread.start()
 
+    def _trans_retry_item(self, index: int) -> None:
+        """Manually retry a single failed transcription item."""
+        if not hasattr(self, "_trans_batch_items") or index >= len(self._trans_batch_items):
+            return
+        
+        self.cancelled_indices.discard(index)
+        title, link = self._trans_batch_items[index]
+        
+        def _worker():
+            # Create a dedicated aligner/transcriber for the retry
+            provider = self.trans_provider_var.get()
+            transcriber = None
+            if provider == "Groq AI (Fastest)":
+                transcriber = GroqTranscriber(self.log, self.groq_key_var.get())
+            else:
+                transcriber = WhisperAligner.try_create(self.log)
+                
+            if not transcriber:
+                self.root.after(0, self.trans_manager.set_item_status, index, "Failed (AI Init)", "#FF3B30")
+                return
+
+            self._trans_item_task(index, title, link, transcriber, is_retry=True)
+            
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _trans_skip_item(self, index: int) -> None:
+        """Mark a transcription item as skipped."""
+        with self._state_lock:
+            if self.trans_manager:
+                self.trans_manager.set_item_status(index, "Skipped", "#34C759")
+            self.log(f"-> Transcription item marked as skipped: {index + 1}")
+
+    def _trans_item_task(self, index: int, title: str, link: str, transcriber, is_retry: bool = False) -> bool:
+        """Worker for a single transcription item. Returns True if successful."""
+        if self._is_cancelled() or index in self.cancelled_indices:
+            return False
+            
+        status = "Retrying..." if is_retry else "Active"
+        self.root.after(0, self.trans_manager.set_item_status, index, status, self.accent_color)
+        
+        # 1. Extract audio
+        audio_path = self._extract_audio_only(title, link, index)
+        if not audio_path:
+            self.log(f"-> Failed to extract audio for: {title}")
+            self.root.after(0, self.trans_manager.set_item_status, index, "Failed (Audio)", "#FF3B30")
+            return False
+
+        # 2. Transcribe
+        self.log(f"-> Transcribing: {title}")
+        
+        def progress_cb(curr, total):
+            if total > 0:
+                percent = (curr / total) * 100
+                self.root.after(0, self.trans_manager.update_item_progress, index, percent)
+
+        transcript = transcriber.transcribe_to_text(
+            audio_path, is_cancelled=self._is_cancelled, progress_callback=progress_cb
+        )
+        
+        # Cleanup temp audio immediately to save space
+        if audio_path and os.path.exists(audio_path):
+            try: os.remove(audio_path)
+            except: pass
+
+        if transcript:
+            # Note: We don't save to combined report here because it's a single task.
+            # The batch worker handles collection.
+            # But for manual retry, we might want to update the combined report? 
+            # Or just save an individual one. 
+            # Let's save an individual one as fallback.
+            self._save_transcription_report(title, link, transcript)
+            self.root.after(0, self.trans_manager.set_item_status, index, "Finished", "#34C759")
+            return True
+        else:
+            self.root.after(0, self.trans_manager.set_item_status, index, "Failed", "#FF3B30")
+            return False
+
     def _transcribe_batch_worker(self, titles: List[str], links: List[str]) -> None:
         self.log(f"\n--- Starting Batch Transcription ({len(links)} items) ---")
+        self._trans_batch_items = list(zip(titles, links)) # Store for retries
         
         provider = self.trans_provider_var.get()
         concurrent_mode = self.concurrent_var.get()
         max_workers = self.max_concurrent_var.get() if concurrent_mode else 1
         
-        all_results = []
+        all_results = [None] * len(titles) # Use fixed size for order
         results_lock = threading.Lock()
         
         transcriber = None
@@ -1261,55 +1339,68 @@ class AppleStyleApp:
             self.root.after(0, self.reset_ui)
             return
 
-        def _item_task(index: int, title: str, link: str):
-            if self._is_cancelled():
-                return
-            
-            self.root.after(0, self.trans_manager.set_item_status, index, "Active", self.accent_color)
-            
-            # 1. Extract audio
-            audio_path = self._extract_audio_only(title, link, index)
-            if not audio_path:
-                self.log(f"-> Failed to extract audio for: {title}")
-                self.root.after(0, self.trans_manager.set_item_status, index, "Failed (Audio)", "#FF3B30")
-                return
+        items = list(zip(range(len(titles)), titles, links))
+        failed_items = []
 
-            # 2. Transcribe
-            self.log(f"-> Transcribing: {title}")
-            
-            def progress_cb(curr, total):
-                if total > 0:
-                    percent = (curr / total) * 100
-                    self.root.after(0, self.trans_manager.update_item_progress, index, percent)
-
-            transcript = transcriber.transcribe_to_text(
-                audio_path, is_cancelled=self._is_cancelled, progress_callback=progress_cb
-            )
-            
-            if transcript:
-                with results_lock:
-                    all_results.append((title, link, transcript))
-                self.root.after(0, self.trans_manager.set_item_status, index, "Finished", "#34C759")
-            else:
-                self.root.after(0, self.trans_manager.set_item_status, index, "Failed", "#FF3B30")
-                
-            # Cleanup temp audio
-            if os.path.exists(audio_path):
-                try: os.remove(audio_path)
-                except: pass
-
+        # Phase 1: Initial Run
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(_item_task, i, title, link) for i, (title, link) in enumerate(zip(titles, links))]
-            for future in futures:
-                future.result()
+            futures = {}
+            for i, title, link in items:
+                futures[executor.submit(self._trans_item_task, i, title, link, transcriber)] = (i, title, link)
+            
+            for future, (i, title, link) in futures.items():
+                success = future.result()
+                if not success and not self._is_cancelled() and i not in self.cancelled_indices:
+                    failed_items.append((i, title, link))
 
-        # 3. Save combined report
-        if all_results and not self._is_cancelled():
-            self._save_combined_transcription_report(all_results)
-            self.log(f"\n--- Combined Report Saved for {len(all_results)} items ---")
+        # Phase 2: Auto-Retries (up to 2 times)
+        for attempt in range(1, 3):
+            if not failed_items or self._is_cancelled():
+                break
+            self.log(f"\n--- Auto-Retry attempt {attempt} for {len(failed_items)} items ---")
+            still_failing = []
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                retry_futures = {}
+                for i, title, link in failed_items:
+                    retry_futures[executor.submit(self._trans_item_task, i, title, link, transcriber, is_retry=True)] = (i, title, link)
+                for future, (i, title, link) in retry_futures.items():
+                    if not future.result() and not self._is_cancelled() and i not in self.cancelled_indices:
+                        still_failing.append((i, title, link))
+            failed_items = still_failing
+
+        # 3. Save combined report (only for items that finished)
+        # We need to collect results. Wait, _trans_item_task didn't return the transcript.
+        # Let's fix that.
+        # Actually, let's just re-read finished individual reports if needed, 
+        # OR just have _trans_item_task store it in a shared dict.
         
-        self.log("\n--- Batch Transcription Complete ---")
-        self.root.after(0, self.reset_ui)
+        # (Re-running logic to collect results properly)
+        final_results = []
+        for i, (title, link) in enumerate(self._trans_batch_items):
+            safe_title = sanitize_filename(title)
+            report_path = self.downloads_dir / f"{safe_title} (Transcript).txt"
+            if report_path.exists():
+                try:
+                    with report_path.open("r", encoding="utf-8") as f:
+                        content = f.read()
+                        # Extract the transcription part (after the header)
+                        parts = content.split("-" * 40 + "\n\n")
+                        if len(parts) > 1:
+                            final_results.append((title, link, parts[1]))
+                except:
+                    pass
+
+        if final_results and not self._is_cancelled():
+            self._save_combined_transcription_report(final_results)
+            self.log(f"\n--- Combined Report Updated for {len(final_results)} items ---")
+        
+        has_failures = any(item.status_label["text"] == "Failed" for item in self.trans_manager.items)
+        if has_failures and not self._is_cancelled():
+            self.log("\nBatch finished with errors. You can manually Retry or Skip items now.")
+            self.root.after(0, lambda: self.trans_btn.config_state("normal", text="Finish & Return", bg="#34C759"))
+        else:
+            self.log("\n--- Batch Transcription Complete ---")
+            self.root.after(0, self.reset_ui)
 
     def _save_combined_transcription_report(self, results: List[Tuple[str, str, str]]) -> None:
         report_path = self.downloads_dir / "All_Transcriptions.txt"
