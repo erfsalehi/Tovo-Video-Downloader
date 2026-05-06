@@ -414,6 +414,23 @@ class AppleStyleApp:
         self.groq_key_entry.pack(side=tk.LEFT)
         self.groq_key_entry.entry.bind("<FocusOut>", lambda e: self._save_config())
 
+        # Concurrency for transcription
+        self.trans_concurrent_var = tk.BooleanVar(value=self.config.get("trans_concurrent", False))
+        ModernCheckbutton(
+            parent, text="Simultaneous Transcriptions",
+            variable=self.trans_concurrent_var, bg_color=self.bg_color,
+            command=self._save_config,
+        ).pack(side=tk.LEFT, padx=(20, 0))
+
+        self.trans_max_concurrent_var = tk.IntVar(value=self.config.get("trans_max_concurrent", 5))
+        tk.Label(parent, text="Max:", bg=self.bg_color, fg=self.text_color,
+                 font=(self.font_family, 10)).pack(side=tk.LEFT, padx=(10, 4))
+        self.trans_max_concurrent_spin = tk.Spinbox(
+            parent, from_=1, to=20, textvariable=self.trans_max_concurrent_var,
+            width=3, font=(self.font_family, 10), command=self._save_config,
+        )
+        self.trans_max_concurrent_spin.pack(side=tk.LEFT)
+
     def _build_dl_button_row(self, parent: tk.Frame, row: int) -> None:
         frame = tk.Frame(parent, bg=self.bg_color)
         frame.grid(row=row, column=0, sticky="ew", pady=(8, 16), padx=10)
@@ -490,6 +507,8 @@ class AppleStyleApp:
         self.config.set("use_browser_cookies", self.use_browser_cookies.get())
         self.config.set("transcription_provider", self.trans_provider_var.get())
         self.config.set("groq_api_key", self.groq_key_var.get())
+        self.config.set("trans_concurrent", self.trans_concurrent_var.get())
+        self.config.set("trans_max_concurrent", self.trans_max_concurrent_var.get())
         self.config.save()
 
     def browse_directory(self) -> None:
@@ -1195,9 +1214,11 @@ class AppleStyleApp:
         
         self.trans_btn.config_state("disabled", text="Transcribing...", bg="#E5E5EA")
         self.trans_cancel_btn.config_state("normal", bg="#FF3B30")
+        self.groq_key_entry.entry.config(state="disabled")
         
         # Hide input, show manager in transcription tab
-        self.trans_input_text.grid_remove() # Note: trans_input_frame is not a thing yet, let's check UI structure
+        self.trans_input_text.config(state="disabled") # Lock text
+        self.trans_input_text.grid_remove() 
         # Wait, I need to make sure the input area can be hidden. 
         # In _build_trans_tab, it's 'border'. I should save a reference to it.
         if hasattr(self, "trans_border"):
@@ -1305,25 +1326,44 @@ class AppleStyleApp:
             except: pass
 
         if transcript:
-            # Note: We don't save to combined report here because it's a single task.
-            # The batch worker handles collection.
-            # But for manual retry, we might want to update the combined report? 
-            # Or just save an individual one. 
-            # Let's save an individual one as fallback.
-            self._save_transcription_report(title, link, transcript)
+            # Append to the combined report immediately
+            self._append_to_combined_report(title, link, transcript)
             self.root.after(0, self.trans_manager.set_item_status, index, "Finished", "#34C759")
             return True
         else:
             self.root.after(0, self.trans_manager.set_item_status, index, "Failed", "#FF3B30")
             return False
 
+    def _append_to_combined_report(self, title: str, link: str, transcript: str) -> None:
+        report_path = self.downloads_dir / "All_Transcriptions.txt"
+        with self._state_lock: # Reuse state lock for file writing safety
+            try:
+                first_write = not report_path.exists()
+                with report_path.open("a", encoding="utf-8") as f:
+                    if first_write:
+                        f.write("--- BATCH TRANSCRIPTION REPORT ---\n\n")
+                    f.write(f"TITLE: {title}\n")
+                    f.write(f"LINK: {link}\n")
+                    f.write("-" * 20 + "\n")
+                    f.write(transcript.strip())
+                    f.write("\n\n" + "=" * 60 + "\n\n")
+            except OSError as e:
+                self.log(f"[!] Error appending to report: {e}")
+
     def _transcribe_batch_worker(self, titles: List[str], links: List[str]) -> None:
         self.log(f"\n--- Starting Batch Transcription ({len(links)} items) ---")
-        self._trans_batch_items = list(zip(titles, links)) # Store for retries
+        
+        # Clear/initialize combined report at start of batch
+        report_path = self.downloads_dir / "All_Transcriptions.txt"
+        if report_path.exists():
+            try: report_path.unlink()
+            except: pass
+
+        self._trans_batch_items = list(zip(titles, links)) 
         
         provider = self.trans_provider_var.get()
-        concurrent_mode = self.concurrent_var.get()
-        max_workers = self.max_concurrent_var.get() if concurrent_mode else 1
+        concurrent_mode = self.trans_concurrent_var.get()
+        max_workers = self.trans_max_concurrent_var.get() if concurrent_mode else 1
         
         all_results = [None] * len(titles) # Use fixed size for order
         results_lock = threading.Lock()
@@ -1374,32 +1414,20 @@ class AppleStyleApp:
         # Actually, let's just re-read finished individual reports if needed, 
         # OR just have _trans_item_task store it in a shared dict.
         
-        # (Re-running logic to collect results properly)
-        final_results = []
-        for i, (title, link) in enumerate(self._trans_batch_items):
-            safe_title = sanitize_filename(title)
-            report_path = self.downloads_dir / f"{safe_title} (Transcript).txt"
-            if report_path.exists():
-                try:
-                    with report_path.open("r", encoding="utf-8") as f:
-                        content = f.read()
-                        # Extract the transcription part (after the header)
-                        parts = content.split("-" * 40 + "\n\n")
-                        if len(parts) > 1:
-                            final_results.append((title, link, parts[1]))
-                except:
-                    pass
+        # Phase 2 and 3 omitted for brevity in targetContent, but I need to make sure I don't break them.
+        # Wait, the targetContent I picked is too large or I might mess up.
+        # Let's just replace the result collection part.
 
-        if final_results and not self._is_cancelled():
-            self._save_combined_transcription_report(final_results)
-            self.log(f"\n--- Combined Report Updated for {len(final_results)} items ---")
+        # (Removing the old result collection logic since we append in real-time now)
         
         has_failures = any(item.status_label["text"] == "Failed" for item in self.trans_manager.items)
         if has_failures and not self._is_cancelled():
             self.log("\nBatch finished with errors. You can manually Retry or Skip items now.")
+            self.log(f"Partial results saved in: {report_path.name}")
             self.root.after(0, lambda: self.trans_btn.config_state("normal", text="Finish & Return", bg="#34C759"))
         else:
             self.log("\n--- Batch Transcription Complete ---")
+            self.log(f"All results saved in: {report_path.name}")
             self.root.after(0, self.reset_ui)
 
     def _save_combined_transcription_report(self, results: List[Tuple[str, str, str]]) -> None:
@@ -1531,6 +1559,7 @@ class AppleStyleApp:
         # Reset Transcription Tab Buttons
         self.trans_btn.config_state("normal", text="🎙  Start Transcription", bg=self.accent_color)
         self.trans_cancel_btn.config_state("disabled", bg="#E5E5EA")
+        self.groq_key_entry.entry.config(state="normal")
         if hasattr(self, "trans_border"):
             self.trans_border.grid()
         if hasattr(self, "trans_manager") and self.trans_manager:
