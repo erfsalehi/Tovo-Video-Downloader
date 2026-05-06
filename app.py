@@ -1505,18 +1505,34 @@ class AppleStyleApp:
         safe_title = sanitize_filename(title)
         output_path = self.downloads_dir / f"{safe_title}_audio.mp3"
         
+        yt_dlp_exe = BASE_PATH / "yt-dlp.exe"
+        exe_path = str(yt_dlp_exe) if yt_dlp_exe.exists() else "yt-dlp"
+
         # yt-dlp command to just get audio
         cmd = [
-            "yt-dlp",
+            exe_path,
             "-x", "--audio-format", "mp3",
             "--audio-quality", "0",
             "-o", str(output_path),
-            link
+            "--no-playlist",
         ]
-        
-        if self.use_browser_cookies.get():
+
+        cookies_txt = BASE_PATH / "cookies.txt"
+        if cookies_txt.exists():
+            cmd.extend(["--cookies", str(cookies_txt)])
+        elif self.use_browser_cookies.get():
             cmd.extend(["--cookies-from-browser", "chrome"])
-            
+
+        deno_exe = BASE_PATH / "deno.exe"
+        if deno_exe.exists():
+            cmd.extend(["--js-runtime", "deno:" + str(deno_exe)])
+
+        ffmpeg_exe = BASE_PATH / "ffmpeg.exe"
+        if ffmpeg_exe.exists():
+            cmd.extend(["--ffmpeg-location", str(ffmpeg_exe)])
+
+        cmd.append(link)
+        
         self.log(f"-> Extracting audio for {title}...")
         
         def audio_progress(p):
