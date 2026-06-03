@@ -10,6 +10,7 @@ import logging
 import os
 import shutil
 import ssl
+import subprocess
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -156,6 +157,41 @@ def _download_deno(base_path: Path, log: LogFn) -> None:
     if not target.exists():
         raise RuntimeError("Deno extraction failed.")
     log("   Done!")
+
+
+def update_yt_dlp(base_path: Path, log: LogFn) -> bool:
+    """Update the bundled yt-dlp in place via its built-in self-updater.
+
+    yt-dlp's ``-U`` checks the latest stable release and only rewrites the
+    binary when it is actually outdated, so this is cheap to call when already
+    current. Returns True if the command ran (whether or not an update was
+    applied), False if yt-dlp could not be located or launched.
+    """
+    exe = base_path / "yt-dlp.exe"
+    exe_path = str(exe) if exe.exists() else shutil.which("yt-dlp")
+    if not exe_path:
+        log("-> yt-dlp not found; cannot check for updates.")
+        return False
+
+    log("-> Checking for yt-dlp updates...")
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    try:
+        result = subprocess.run(
+            [exe_path, "-U"], capture_output=True, text=True,
+            timeout=120, creationflags=creationflags,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"-> yt-dlp update check failed: {e}")
+        logger.warning("yt-dlp update failed: %s", e)
+        return False
+
+    output = (result.stdout + result.stderr).strip()
+    for line in output.splitlines():
+        line = line.strip()
+        if line:
+            log("  " + line)
+    logger.info("yt-dlp -U (exit %s): %s", result.returncode, output)
+    return True
 
 
 def install_all(base_path: Path, log: LogFn) -> None:

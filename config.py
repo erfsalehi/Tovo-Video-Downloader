@@ -18,6 +18,8 @@ DEFAULTS: dict[str, Any] = {
     "groq_api_key": "",
     "transcription_provider": "Local Whisper",
     "disable_proxy": True,
+    "use_tv_client": False,
+    "last_yt_dlp_update_check": "",
 }
 
 

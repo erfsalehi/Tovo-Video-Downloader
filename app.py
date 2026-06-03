@@ -1,12 +1,15 @@
 """Tovo Video Downloader - GUI entry point and download orchestration."""
 from __future__ import annotations
 
+import datetime
 import logging
 import os
 import re
+import shutil
 import subprocess
 import threading
 import tkinter as tk
+from collections import deque
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -14,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
 
 from config import Config
-from dependencies import find_missing_tools, install_all
+from dependencies import find_missing_tools, install_all, update_yt_dlp
 import requests
 from subtitles import WhisperAligner, GroqTranscriber, generate_standard_srt
 from widgets import DownloadManager, RoundedButton, RoundedEntry, ModernCheckbutton, RoundedFrame
@@ -639,7 +642,7 @@ class AppleStyleApp:
 
         tools_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Tools", menu=tools_menu)
-        tools_menu.add_command(label="Force Update yt-dlp & FFmpeg", command=lambda: threading.Thread(target=self._download_tools_thread, daemon=True).start())
+        tools_menu.add_command(label="Force Update yt-dlp & FFmpeg", command=lambda: threading.Thread(target=self._download_tools_thread, kwargs={"force_update": True}, daemon=True).start())
         tools_menu.add_command(label="Clear local cookies.txt", command=self.clear_local_cookies)
         
         help_menu = tk.Menu(menubar, tearoff=0)
@@ -688,7 +691,52 @@ class AppleStyleApp:
     # ------------------------------------------------------------------
     # Dependencies
     # ------------------------------------------------------------------
+    def _log_environment(self) -> None:
+        """Record tool locations and yt-dlp version to the log file.
+
+        This is the first thing to compare when a batch works on one machine
+        but fails on another: a missing deno/ffmpeg or an outdated yt-dlp is
+        the usual culprit behind TikTok/YouTube 'exit code 1' failures.
+        """
+        for name in ("yt-dlp", "ffmpeg", "ffprobe", "deno"):
+            local = BASE_PATH / f"{name}.exe"
+            location = str(local) if local.exists() else (shutil.which(name) or "NOT FOUND")
+            logger.info("Tool %s: %s", name, location)
+
+        yt_dlp_exe = BASE_PATH / "yt-dlp.exe"
+        exe = str(yt_dlp_exe) if yt_dlp_exe.exists() else (shutil.which("yt-dlp") or "")
+        if exe:
+            try:
+                creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                result = subprocess.run(
+                    [exe, "--version"], capture_output=True, text=True,
+                    timeout=15, creationflags=creationflags,
+                )
+                logger.info("yt-dlp version: %s", result.stdout.strip() or result.stderr.strip())
+            except (OSError, subprocess.SubprocessError) as e:
+                logger.warning("Could not query yt-dlp version: %s", e)
+
+    def _maybe_auto_update_yt_dlp(self, force: bool = False) -> None:
+        """Update yt-dlp at most once per day (always when ``force``).
+
+        TikTok/YouTube break frequently against stale yt-dlp builds, so we keep
+        the bundled binary current. Throttled via a stored date so normal
+        launches stay fast and offline-friendly.
+        """
+        today = datetime.date.today().isoformat()
+        if not force and self.config.get("last_yt_dlp_update_check", "") == today:
+            return
+        if update_yt_dlp(BASE_PATH, self.log):
+            self.config.set("last_yt_dlp_update_check", today)
+            self.config.save()
+
+    def _startup_maintenance(self) -> None:
+        """Background startup work: log the environment and refresh yt-dlp."""
+        self._log_environment()
+        self._maybe_auto_update_yt_dlp()
+
     def check_dependencies(self) -> None:
+        threading.Thread(target=self._startup_maintenance, daemon=True).start()
         missing = find_missing_tools(BASE_PATH)
         if not missing:
             return
@@ -704,12 +752,16 @@ class AppleStyleApp:
         else:
             self.log("[!] Warning: Missing dependencies. App may not function correctly.")
 
-    def _download_tools_thread(self) -> None:
+    def _download_tools_thread(self, force_update: bool = False) -> None:
         try:
+            # Pull in anything missing first (fresh machine), then force the
+            # in-place yt-dlp self-update so an already-present but stale binary
+            # actually gets refreshed.
             install_all(BASE_PATH, self.log)
+            self._maybe_auto_update_yt_dlp(force=force_update)
             self.root.after(
                 0, messagebox.showinfo, "Setup Complete",
-                "All dependencies have been downloaded and installed successfully.",
+                "All dependencies have been downloaded and updated successfully.",
             )
         except Exception as e:
             logger.exception("Dependency setup failed")
@@ -1026,18 +1078,23 @@ class AppleStyleApp:
             text=True, creationflags=creationflags,
         )
         self._add_active_process(index, proc)
-        
+
         # Regex for yt-dlp progress: [download]  10.0% of ...
         progress_re = re.compile(r"\[download\]\s+(\d+\.\d+)%")
+        # Keep the tail of yt-dlp's output so we can record the real failure
+        # reason (e.g. "ERROR: ... Unable to extract") to the log file, not just
+        # the bare exit code. This is what lets us diagnose per-machine failures.
+        recent_output: deque = deque(maxlen=25)
 
         try:
             assert proc.stdout is not None
             for line in proc.stdout:
                 if self._is_cancelled():
                     break
-                
+
                 clean_line = line.strip()
                 if clean_line:
+                    recent_output.append(clean_line)
                     self.log("  " + clean_line)
                     if progress_callback:
                         match = progress_re.search(clean_line)
@@ -1053,7 +1110,15 @@ class AppleStyleApp:
             except subprocess.TimeoutExpired:
                 self._terminate_process(proc)
                 proc.wait()
-            return proc.returncode if proc.returncode is not None else -1
+            return_code = proc.returncode if proc.returncode is not None else -1
+            if return_code != 0 and not self._is_cancelled():
+                logger.error(
+                    "yt-dlp exited %s using %s\n  Last output:\n%s",
+                    return_code,
+                    cmd[0],
+                    "\n".join(f"    {ln}" for ln in recent_output) or "    (no output captured)",
+                )
+            return return_code
         finally:
             self._remove_active_process(index)
 
