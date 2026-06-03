@@ -471,6 +471,29 @@ class AppleStyleApp:
             command=self._save_config,
         ).pack(side=tk.LEFT, padx=(15, 0))
 
+        # Third row: explicit proxy (for machines behind a local VPN proxy such
+        # as V2RayN / Hiddify, where direct connections fail).
+        row3 = tk.Frame(frame, bg=self.bg_color)
+        row3.pack(fill="x", pady=(5, 0))
+        row3.grid_columnconfigure(1, weight=1)
+
+        tk.Label(
+            row3, text="Proxy:", bg=self.bg_color, fg=self.text_color,
+            font=(self.font_family, 10, "bold"),
+        ).grid(row=0, column=0, sticky="w", padx=(0, 8))
+
+        self.proxy_url_var = tk.StringVar(value=self.config.get("proxy_url", ""))
+        self.proxy_entry = RoundedEntry(
+            row3, variable=self.proxy_url_var, radius=12, bg_color="white",
+        )
+        self.proxy_entry.grid(row=0, column=1, sticky="ew")
+        self.proxy_entry.entry.bind("<FocusOut>", lambda e: self._save_config())
+
+        tk.Label(
+            row3, text="e.g. socks5://127.0.0.1:10808  or  http://127.0.0.1:10809",
+            bg=self.bg_color, fg="#86868B", font=(self.font_family, 9),
+        ).grid(row=1, column=1, sticky="w", pady=(2, 0))
+
     def _build_transcription_settings(self, parent: tk.Frame) -> None:
         tk.Label(
             parent, text="Transcription Provider:", bg=self.bg_color, fg=self.text_color,
@@ -596,6 +619,7 @@ class AppleStyleApp:
         self.config.set("use_browser_cookies", self.use_browser_cookies.get())
         self.config.set("disable_proxy", self.disable_proxy_var.get())
         self.config.set("use_tv_client", self.use_tv_client_var.get())
+        self.config.set("proxy_url", self.proxy_url_var.get().strip())
         self.config.set("transcription_provider", self.trans_provider_var.get())
         self.config.set("groq_api_key", self.groq_key_var.get())
         self.config.set("trans_concurrent", self.trans_concurrent_var.get())
@@ -726,7 +750,8 @@ class AppleStyleApp:
         today = datetime.date.today().isoformat()
         if not force and self.config.get("last_yt_dlp_update_check", "") == today:
             return
-        if update_yt_dlp(BASE_PATH, self.log):
+        proxy = self.config.get("proxy_url", "") or ""
+        if update_yt_dlp(BASE_PATH, self.log, proxy=proxy):
             self.config.set("last_yt_dlp_update_check", today)
             self.config.save()
 
@@ -1020,6 +1045,19 @@ class AppleStyleApp:
         with self._state_lock:
             return self.cancelled
 
+    def _proxy_args(self) -> List[str]:
+        """yt-dlp ``--proxy`` arguments based on the user's settings.
+
+        An explicit proxy URL (for a local VPN proxy like V2RayN/Hiddify) wins;
+        otherwise the "Disable System Proxy" toggle forces a direct connection.
+        """
+        proxy = self.proxy_url_var.get().strip()
+        if proxy:
+            return ["--proxy", proxy]
+        if self.disable_proxy_var.get():
+            return ["--proxy", ""]
+        return []
+
     def _add_active_process(self, index: int, proc: subprocess.Popen) -> None:
         with self._state_lock:
             self.active_processes[index] = proc
@@ -1063,8 +1101,7 @@ class AppleStyleApp:
         ffmpeg_exe = BASE_PATH / "ffmpeg.exe"
         if ffmpeg_exe.exists():
             cmd.extend(["--ffmpeg-location", str(ffmpeg_exe)])
-        if self.disable_proxy_var.get():
-            cmd.extend(["--proxy", ""])
+        cmd.extend(self._proxy_args())
 
         cmd.append(link)
         return cmd
@@ -1424,7 +1461,7 @@ class AppleStyleApp:
             provider = self.trans_provider_var.get()
             transcriber = None
             if provider == "Groq AI (Fastest)":
-                transcriber = GroqTranscriber(self.log, self.groq_key_var.get())
+                transcriber = GroqTranscriber(self.log, self.groq_key_var.get(), proxy=self.proxy_url_var.get().strip())
             else:
                 transcriber = WhisperAligner.try_create(self.log)
                 
@@ -1526,7 +1563,7 @@ class AppleStyleApp:
         
         transcriber = None
         if provider == "Groq AI (Fastest)":
-            transcriber = GroqTranscriber(self.log, self.groq_key_var.get())
+            transcriber = GroqTranscriber(self.log, self.groq_key_var.get(), proxy=self.proxy_url_var.get().strip())
         else:
             transcriber = WhisperAligner.try_create(self.log)
 
@@ -1631,6 +1668,8 @@ class AppleStyleApp:
         deno_exe = BASE_PATH / "deno.exe"
         if deno_exe.exists():
             cmd.extend(["--js-runtime", "deno:" + str(deno_exe)])
+
+        cmd.extend(self._proxy_args())
 
         cmd.append(link)
 

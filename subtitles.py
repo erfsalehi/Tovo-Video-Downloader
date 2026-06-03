@@ -231,9 +231,10 @@ class WhisperAligner:
 class GroqTranscriber:
     """Uses Groq's cloud Whisper API for fast transcription."""
 
-    def __init__(self, log: LogFn, api_key: str) -> None:
+    def __init__(self, log: LogFn, api_key: str, proxy: str = "") -> None:
         self.log = log
         self.api_key = api_key
+        self.proxy = proxy
         self.url = "https://api.groq.com/openai/v1/audio/transcriptions"
 
     def transcribe_to_text(
@@ -274,7 +275,11 @@ class GroqTranscriber:
                     "response_format": "text"
                 }
                 headers = {"Authorization": f"Bearer {self.api_key}"}
-                response = requests.post(self.url, headers=headers, files=files, data=data, timeout=60)
+                proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
+                response = requests.post(
+                    self.url, headers=headers, files=files, data=data,
+                    timeout=60, proxies=proxies,
+                )
 
             if response.status_code != 200:
                 self.log(f"[!] Groq API Error: {response.status_code} - {response.text}")

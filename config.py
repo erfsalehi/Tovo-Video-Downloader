@@ -19,6 +19,7 @@ DEFAULTS: dict[str, Any] = {
     "transcription_provider": "Local Whisper",
     "disable_proxy": True,
     "use_tv_client": False,
+    "proxy_url": "",
     "last_yt_dlp_update_check": "",
 }
 
