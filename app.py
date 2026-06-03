@@ -9,8 +9,9 @@ import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Callable, Dict, List, Optional, Sequence, Set
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from concurrent.futures import ThreadPoolExecutor
+from logging.handlers import RotatingFileHandler
 
 from config import Config
 from dependencies import find_missing_tools, install_all
@@ -21,6 +22,8 @@ from widgets import DownloadManager, RoundedButton, RoundedEntry, ModernCheckbut
 logger = logging.getLogger(__name__)
 
 BASE_PATH = Path(__file__).resolve().parent
+LOG_DIR = BASE_PATH / "logs"
+LOG_FILE = LOG_DIR / "tovo.log"
 URL_PREFIXES = ("http://", "https://")
 INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 DOWNLOAD_FILE_EXTENSIONS = (".mp4", ".srt", ".txt", ".mp3", ".wav", ".m4a")
@@ -588,6 +591,8 @@ class AppleStyleApp:
         self.config.set("concurrent_downloads", self.concurrent_var.get())
         self.config.set("max_concurrent", self.max_concurrent_var.get())
         self.config.set("use_browser_cookies", self.use_browser_cookies.get())
+        self.config.set("disable_proxy", self.disable_proxy_var.get())
+        self.config.set("use_tv_client", self.use_tv_client_var.get())
         self.config.set("transcription_provider", self.trans_provider_var.get())
         self.config.set("groq_api_key", self.groq_key_var.get())
         self.config.set("trans_concurrent", self.trans_concurrent_var.get())
@@ -713,30 +718,6 @@ class AppleStyleApp:
                 0, messagebox.showerror, "Setup Error",
                 f"Failed to download dependencies: {e}\n\nPlease install them manually.",
             )
-
-    @staticmethod
-    def _is_url(line: str) -> bool:
-        return line.lower().startswith(URL_PREFIXES)
-
-    def _parse_input(self, lines: Sequence[str]):
-        titles: List[str] = []
-        links: List[str] = []
-        subtitles_list: List[List[str]] = []
-
-        link_indices: List[int] = []
-        for i, line in enumerate(lines):
-            if self._is_url(line) and i > 0 and not self._is_url(lines[i - 1]):
-                link_indices.append(i)
-
-        for idx_pos, link_idx in enumerate(link_indices):
-            titles.append(lines[link_idx - 1])
-            links.append(lines[link_idx])
-
-            start = link_idx + 1
-            end = link_indices[idx_pos + 1] - 1 if idx_pos + 1 < len(link_indices) else len(lines)
-            subtitles_list.append(list(lines[start:end]))
-
-        return titles, links, subtitles_list
 
     # ------------------------------------------------------------------
     # Cancellation / state
@@ -868,13 +849,14 @@ class AppleStyleApp:
 
 
     def start_download(self) -> None:
-        # Ignore the click while a batch is actively running.
-        if self.downloading and self.download_btn.text != "Finish & Return":
-            return
-        # If the previous batch is in the "Finish & Return" review state,
-        # reset first and then process the new input in the same click.
-        if self.downloading:
+        # In the post-batch "Finish & Return" review state the same button just
+        # returns to the start screen — it must NOT kick off a fresh download.
+        if self.downloading and self.download_btn.text == "Finish & Return":
             self.reset_ui()
+            return
+        # Otherwise ignore clicks while a batch is actively running.
+        if self.downloading:
+            return
 
         text = self.dl_input_text.get("1.0", tk.END).strip()
         lines = [line.strip() for line in text.split("\n") if line.strip()]
@@ -1122,6 +1104,7 @@ class AppleStyleApp:
         else:
             self.log(f"-> Error downloading: {title} (Code: {return_code})")
             self.log("   Check the log for details. Common fixes: update yt-dlp or check cookies.")
+            logger.error("Download failed for %r (link=%s) exit code %s", title, link, return_code)
             if not is_retry:
                 if self.download_manager:
                     self.root.after(0, self.download_manager.set_item_status, index, "Failed (Queued for Retry)", "#FF9500")
@@ -1230,14 +1213,15 @@ class AppleStyleApp:
         except OSError as e:
             self.log(f"-> Warning: Could not save batch_links.txt: {e}")
 
-    def _save_errors(self, errors_found: Sequence[str]) -> None:
+    def _save_errors(self, errors_found: Sequence[str], target_dir: Optional[Path] = None) -> None:
+        target_dir = target_dir or self.downloads_dir
         try:
-            path = self.downloads_dir / "errors.txt"
+            path = target_dir / "errors.txt"
             with path.open("w", encoding="utf-8") as ef:
-                ef.write("--- Download Errors ---\n\n")
+                ef.write("--- Errors ---\n\n")
                 for err in errors_found:
                     ef.write(f"- {err}\n")
-            self.log(f"-> Exported {len(errors_found)} errors to errors.txt")
+            self.log(f"-> Exported {len(errors_found)} errors to {path}")
         except OSError as e:
             self.log(f"-> Warning: Could not save errors.txt: {e}")
 
@@ -1281,12 +1265,6 @@ class AppleStyleApp:
                 self.log("-> No matching audio found for sync. Falling back to 2-second timestamps.")
 
         if not whisper_success and not self._is_cancelled():
-            def progress_fallback(curr, total):
-                if self.download_manager:
-                    # aligner doesn't have a clean way to report progress for standard SRT
-                    # but we can just set it to 50% while "Generating..."
-                    self.root.after(0, self.download_manager.update_item_progress, -2, (curr/total)*100) # -2 as dummy if needed
-
             generate_standard_srt(subs, srt_path, self.log)
 
     def _get_dub_track(self, title: str) -> Optional[str]:
@@ -1306,13 +1284,14 @@ class AppleStyleApp:
 
     def start_transcription(self) -> None:
         """Called by the Start button on the Transcription tab."""
-        # Ignore the click while a batch is actively running.
-        if self.downloading and self.trans_btn.text != "Finish & Return":
-            return
-        # If the previous batch is in the "Finish & Return" review state,
-        # reset first and then process the new input in the same click.
-        if self.downloading:
+        # In the post-batch "Finish & Return" review state the same button just
+        # returns to the start screen — it must NOT kick off a fresh batch.
+        if self.downloading and self.trans_btn.text == "Finish & Return":
             self.reset_ui()
+            return
+        # Otherwise ignore clicks while a batch is actively running.
+        if self.downloading:
+            return
 
         text = self.trans_input_text.get("1.0", tk.END).strip()
         if not text:
@@ -1324,10 +1303,20 @@ class AppleStyleApp:
             self.log("[!] Could not find any valid links in the input.")
             return
 
-        self.downloading = True
-        self.cancelled = False
-        self.batch_errors = []
-        
+        with self._state_lock:
+            self.downloading = True
+            self.cancelled = False
+        self.cancelled_indices = set()
+        with self.errors_lock:
+            self.batch_errors = []
+        # Clear any stale errors file from a previous transcription run.
+        trans_errors = self.trans_dir / "errors.txt"
+        if trans_errors.exists():
+            try:
+                trans_errors.unlink()
+            except OSError:
+                pass
+
         self.trans_btn.config_state("disabled", text="Transcribing...", bg="#E5E5EA")
         self.trans_cancel_btn.config_state("normal", bg="#FF3B30")
         self.groq_key_entry.entry.config(state="disabled")
@@ -1353,26 +1342,6 @@ class AppleStyleApp:
         thread = threading.Thread(
             target=self._transcribe_batch_worker,
             args=(titles, links),
-            daemon=True
-        )
-        thread.start()
-
-    def on_transcribe_item(self, index: int) -> None:
-        """Called by the Transcribe button in the Download Manager."""
-        if not self.download_manager or not hasattr(self, "_download_items"):
-            return
-            
-        item = self.download_manager.items[index]
-        title = item.title
-        # Get link from stored download items
-        link = self._download_items[index][1] if index < len(self._download_items) else "Unknown Link"
-        
-        # For single items from the download list, we'll try to find the downloaded video or dub
-        self.root.after(0, self.download_manager.set_item_status, index, "Transcribing...", "#FF9500")
-        
-        thread = threading.Thread(
-            target=self._transcribe_single_worker,
-            args=(index, title, link),
             daemon=True
         )
         thread.start()
@@ -1421,7 +1390,10 @@ class AppleStyleApp:
         audio_path = self._extract_audio_only(title, link, index)
         if not audio_path:
             self.log(f"-> Failed to extract audio for: {title}")
+            logger.error("Transcription audio extraction failed for %r (link=%s)", title, link)
             self.root.after(0, self.trans_manager.set_item_status, index, "Failed (Audio)", "#FF3B30")
+            with self.errors_lock:
+                self.batch_errors.append(f"Audio Extraction Error for '{title}'")
             return False
 
         # 2. Transcribe
@@ -1447,7 +1419,10 @@ class AppleStyleApp:
             self.root.after(0, self.trans_manager.set_item_status, index, "Finished", "#34C759")
             return True
         else:
+            logger.error("Transcription produced no text for %r (link=%s)", title, link)
             self.root.after(0, self.trans_manager.set_item_status, index, "Failed", "#FF3B30")
+            with self.errors_lock:
+                self.batch_errors.append(f"Transcription Error for '{title}'")
             return False
 
     def _append_to_combined_report(self, title: str, link: str, transcript: str) -> None:
@@ -1524,18 +1499,13 @@ class AppleStyleApp:
                         still_failing.append((i, title, link))
             failed_items = still_failing
 
-        # 3. Save combined report (only for items that finished)
-        # We need to collect results. Wait, _trans_item_task didn't return the transcript.
-        # Let's fix that.
-        # Actually, let's just re-read finished individual reports if needed, 
-        # OR just have _trans_item_task store it in a shared dict.
-        
-        # Phase 2 and 3 omitted for brevity in targetContent, but I need to make sure I don't break them.
-        # Wait, the targetContent I picked is too large or I might mess up.
-        # Let's just replace the result collection part.
+        # Transcripts are appended to the combined report in real time by
+        # _trans_item_task, so there is no separate result-collection step here.
+        # Persist any per-item errors next to the transcriptions for diagnosis.
+        with self.errors_lock:
+            if self.batch_errors:
+                self._save_errors(self.batch_errors, target_dir=self.trans_dir)
 
-        # (Removing the old result collection logic since we append in real-time now)
-        
         # Batch finished logic
         has_failures = any(item.status_label["text"] in ("Failed", "Failed (Retry)") for item in self.trans_manager.items)
         if not self._is_cancelled():
@@ -1550,76 +1520,6 @@ class AppleStyleApp:
         else:
             self.log("\nBatch transcription cancelled by user.")
             self.root.after(0, self.reset_ui)
-
-    def _save_combined_transcription_report(self, results: List[Tuple[str, str, str]]) -> None:
-        report_path = self.downloads_dir / "All_Transcriptions.txt"
-        try:
-            with report_path.open("w", encoding="utf-8") as f:
-                f.write("--- BATCH TRANSCRIPTION REPORT ---\n")
-                f.write(f"Generated on: {os.path.basename(str(report_path))}\n\n")
-                for title, link, transcript in results:
-                    f.write(f"TITLE: {title}\n")
-                    f.write(f"LINK: {link}\n")
-                    f.write("-" * 20 + "\n")
-                    f.write(transcript.strip())
-                    f.write("\n\n" + "=" * 60 + "\n\n")
-            self.log(f"-> Combined report saved to: {report_path.name}")
-        except OSError as e:
-            self.log(f"[!] Error saving combined report: {e}")
-
-    def _transcribe_single_worker(self, index: int, title: str, link: str) -> None:
-        # Similar logic but updates the DownloadManager status
-        provider = self.trans_provider_var.get()
-        transcriber = None
-        if provider == "Groq AI (Fastest)":
-            transcriber = GroqTranscriber(self.log, self.groq_key_var.get())
-        else:
-            transcriber = WhisperAligner.try_create(self.log)
-            
-        if not transcriber:
-            self.root.after(0, self.download_manager.set_item_status, index, "Failed", "#FF3B30")
-            return
-
-        # Try to find existing audio/video first
-        audio_source = self._get_dub_track(title)
-        if not audio_source:
-            video_path = self.downloads_dir / f"{sanitize_filename(title)}.mp4"
-            if video_path.exists():
-                audio_source = str(video_path)
-        
-        # If no local file, we have to download audio (though usually single transcribe is called after download)
-        temp_audio = None
-        if not audio_source:
-            self.log(f"-> No local file found for {title}, extracting audio from link...")
-            audio_source = self._extract_audio_only(title, link)
-            temp_audio = audio_source
-
-        if not audio_source:
-            self.root.after(0, self.download_manager.set_item_status, index, "No Audio", "#FF3B30")
-            return
-
-        def progress_cb(curr, total):
-            if total > 0:
-                percent = (curr / total) * 100
-                self.root.after(0, self.download_manager.update_item_progress, index, percent)
-
-        transcript = transcriber.transcribe_to_text(
-            audio_source, is_cancelled=self._is_cancelled, progress_callback=progress_cb
-        )
-        
-        if transcript:
-            # For single items from download tab, we still save individual reports but could also append?
-            # User said "all the transcriptions in 1 text file" for batch. 
-            # For single item click, I'll keep it individual or also save to the combined one?
-            # Let's keep single individual for now as it's a different trigger.
-            self._save_transcription_report(title, link, transcript)
-            self.root.after(0, self.download_manager.set_item_status, index, "Transcript Saved", "#34C759")
-        else:
-            self.root.after(0, self.download_manager.set_item_status, index, "Failed", "#FF3B30")
-
-        if temp_audio and os.path.exists(temp_audio):
-            try: os.remove(temp_audio)
-            except: pass
 
     def _extract_audio_only(self, title: str, link: str, index: int = -1) -> Optional[str]:
         """Download the audio-only stream and return its path.
@@ -1680,6 +1580,7 @@ class AppleStyleApp:
         return_code = self._run_yt_dlp(index, cmd, progress_callback=audio_progress)
 
         if return_code != 0:
+            logger.error("Audio extraction failed for %r (link=%s) exit code %s", title, link, return_code)
             return None
 
         # yt-dlp picked the source extension (.m4a / .webm / .mp3 / ...);
@@ -1688,18 +1589,6 @@ class AppleStyleApp:
         if matches:
             return str(matches[0])
         return None
-
-    def _save_transcription_report(self, title: str, link: str, transcript: str) -> None:
-        safe_title = sanitize_filename(title)
-        report_path = self.trans_dir / f"{safe_title} (Transcript).txt"
-        try:
-            with report_path.open("w", encoding="utf-8") as f:
-                f.write(f"TITLE: {title}\n")
-                f.write(f"LINK: {link}\n")
-                f.write("-" * 40 + "\n\n")
-                f.write(transcript)
-        except OSError as e:
-            self.log(f"[!] Error saving report: {e}")
 
     # ------------------------------------------------------------------
     # UI reset
@@ -1752,11 +1641,39 @@ def _enable_dpi_awareness() -> None:
         logger.debug("Could not enable DPI awareness: %s", e)
 
 
-def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+def _setup_logging() -> None:
+    """Configure logging to both the console and a rotating file.
+
+    When the app runs windowed (pythonw / packaged .exe) there is no console,
+    so error output would otherwise be lost. The file handler in ``logs/`` keeps
+    a durable record of warnings, errors and stack traces for diagnosis.
+    """
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+
+    console = logging.StreamHandler()
+    console.setFormatter(formatter)
+    root.addHandler(console)
+
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+        )
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
+        logger.info("Logging to %s", LOG_FILE)
+    except OSError as e:
+        # Never let a logging failure stop the app from starting.
+        logger.warning("Could not open log file %s: %s", LOG_FILE, e)
+
+
+def main() -> None:
+    _setup_logging()
     _enable_dpi_awareness()
     root = tk.Tk()
     AppleStyleApp(root)

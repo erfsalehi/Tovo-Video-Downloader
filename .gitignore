@@ -28,6 +28,8 @@ batch_links.txt
 
 # Log files
 errors.txt
+logs/
+*.log
 
 # IDE files
 .vscode/

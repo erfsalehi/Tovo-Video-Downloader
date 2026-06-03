@@ -5,11 +5,22 @@ import json
 import logging
 import os
 import requests
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
+
+BASE_PATH = Path(__file__).resolve().parent
+
+
+def _ffmpeg_exe() -> str:
+    """Return the bundled ffmpeg binary if present, else fall back to PATH."""
+    local = BASE_PATH / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+    if local.exists():
+        return str(local)
+    return shutil.which("ffmpeg") or "ffmpeg"
 
 LogFn = Callable[[str], None]
 CancelFn = Callable[[], bool]
@@ -242,7 +253,7 @@ class GroqTranscriber:
         temp_audio = str(Path(audio_path).with_suffix(".tmp.mp3"))
         try:
             cmd = [
-                "ffmpeg", "-y", "-i", audio_path,
+                _ffmpeg_exe(), "-y", "-i", audio_path,
                 "-vn", "-map_metadata", "-1", "-ac", "1", "-ar", "16000", "-b:a", "32k",
                 temp_audio
             ]
@@ -267,6 +278,7 @@ class GroqTranscriber:
 
             if response.status_code != 200:
                 self.log(f"[!] Groq API Error: {response.status_code} - {response.text}")
+                logger.error("Groq API error %s: %s", response.status_code, response.text)
                 return None
 
             if progress_callback:
@@ -276,6 +288,7 @@ class GroqTranscriber:
             return response.text
         except Exception as e:
             self.log(f"[!] Error during Groq transcription: {e}")
+            logger.exception("Groq transcription failed for %s", audio_path)
             return None
         finally:
             if os.path.exists(temp_audio):
