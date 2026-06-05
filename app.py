@@ -19,7 +19,7 @@ from logging.handlers import RotatingFileHandler
 from config import Config
 from dependencies import find_missing_tools, install_all, update_yt_dlp
 import requests
-from subtitles import WhisperAligner, GroqTranscriber, generate_standard_srt
+from subtitles import WhisperAligner, GroqTranscriber, generate_standard_srt, read_srt_cues
 from widgets import DownloadManager, RoundedButton, RoundedEntry, ModernCheckbutton, RoundedFrame
 
 logger = logging.getLogger(__name__)
@@ -30,6 +30,8 @@ LOG_FILE = LOG_DIR / "tovo.log"
 URL_PREFIXES = ("http://", "https://")
 INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 DOWNLOAD_FILE_EXTENSIONS = (".mp4", ".srt", ".txt", ".mp3", ".wav", ".m4a")
+SRT_TITLE_SUFFIX = " (SRT)"  # how _maybe_generate_srt names SRT files
+DUB_AUDIO_EXTENSIONS = (".mp3", ".wav", ".m4a", ".mp4")
 PROCESS_TERMINATE_TIMEOUT = 5  # seconds before SIGKILL fallback
 
 
@@ -101,6 +103,11 @@ class AppleStyleApp:
         self.download_manager: Optional[DownloadManager] = None
         self.cancelled_indices: set[int] = set()
 
+        # Sync tab state
+        self.sync_manager: Optional[DownloadManager] = None
+        self.sync_items: List[dict] = []   # scan results: {title, srt_path, audio_path, kind}
+        self._sync_chosen: List[dict] = []
+
         self.root.after(500, self.check_dependencies)
 
     # ------------------------------------------------------------------
@@ -134,7 +141,15 @@ class AppleStyleApp:
             text_color="#86868B", font=(self.font_family, 11, "bold"),
             width=150, height=45
         )
-        self.btn_trans_tab.pack(side=tk.LEFT)
+        self.btn_trans_tab.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.btn_sync_tab = RoundedButton(
+            tab_frame, text="Sync SRT", command=lambda: self._switch_tab("sync"),
+            radius=20, bg_color=self.bg_color, hover_color=self.gray_hover,
+            text_color="#86868B", font=(self.font_family, 11, "bold"),
+            width=150, height=45
+        )
+        self.btn_sync_tab.pack(side=tk.LEFT)
 
         # Tab Content Area
         self.content_frame = tk.Frame(container, bg=self.bg_color)
@@ -151,7 +166,12 @@ class AppleStyleApp:
         self.trans_tab = tk.Frame(self.content_frame, bg=self.bg_color)
         self.trans_tab.grid(row=0, column=0, sticky="nsew")
         self._build_trans_tab(self.trans_tab)
-        
+
+        # Tab 3: Sync SRT
+        self.sync_tab = tk.Frame(self.content_frame, bg=self.bg_color)
+        self.sync_tab.grid(row=0, column=0, sticky="nsew")
+        self._build_sync_tab(self.sync_tab)
+
         # Initial State
         self._switch_tab("dl")
 
@@ -159,24 +179,24 @@ class AppleStyleApp:
         self._build_log_area(container)
 
     def _switch_tab(self, tab: str) -> None:
-        if tab == "dl":
-            self.dl_tab.tkraise()
-            self.btn_dl_tab.config_state("normal", bg="white")
-            self.btn_dl_tab.text_color = self.accent_color
-            self.btn_dl_tab._draw()
-            
-            self.btn_trans_tab.config_state("normal", bg=self.bg_color)
-            self.btn_trans_tab.text_color = "#86868B"
-            self.btn_trans_tab._draw()
-        else:
-            self.trans_tab.tkraise()
-            self.btn_trans_tab.config_state("normal", bg="white")
-            self.btn_trans_tab.text_color = self.accent_color
-            self.btn_trans_tab._draw()
-            
-            self.btn_dl_tab.config_state("normal", bg=self.bg_color)
-            self.btn_dl_tab.text_color = "#86868B"
-            self.btn_dl_tab._draw()
+        tabs = {
+            "dl": (self.dl_tab, self.btn_dl_tab),
+            "trans": (self.trans_tab, self.btn_trans_tab),
+            "sync": (self.sync_tab, self.btn_sync_tab),
+        }
+        if tab not in tabs:
+            return
+        tabs[tab][0].tkraise()
+        for key, (_frame, btn) in tabs.items():
+            active = key == tab
+            btn.config_state("normal", bg="white" if active else self.bg_color)
+            btn.text_color = self.accent_color if active else "#86868B"
+            btn._draw()
+        self._active_tab = tab
+
+        # Refresh the sync list each time the tab is opened (unless a job runs).
+        if tab == "sync" and not self.downloading:
+            self._scan_sync_items()
 
     def _build_dl_tab(self, parent: tk.Frame) -> None:
         parent.grid_columnconfigure(0, weight=1)
@@ -274,6 +294,95 @@ class AppleStyleApp:
         self._build_trans_concurrent_row(parent, row=5)
         self._build_trans_cookie_row(parent, row=6)
         self._build_trans_button_row(parent, row=7)
+
+    def _build_sync_tab(self, parent: tk.Frame) -> None:
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(2, weight=1, minsize=160)
+
+        tk.Label(
+            parent, text="Subtitle Sync (Whisper AI)", bg=self.bg_color, fg=self.text_color,
+            font=(self.font_family, 22, "bold"),
+        ).grid(row=0, column=0, sticky="w", pady=(20, 2), padx=10)
+
+        tk.Label(
+            parent,
+            text="Re-time existing .srt files against the voiceover (Dub folder) or the "
+                 "downloaded video. Picks the Dub track when available.",
+            bg=self.bg_color, fg="#86868B", font=(self.font_family, 10), justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(0, 8), padx=10)
+
+        # Selection area (listbox + controls) — hidden and replaced by the
+        # progress manager while a sync runs, like the other tabs' input frames.
+        self.sync_select_frame = tk.Frame(parent, bg=self.bg_color)
+        self.sync_select_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 12), padx=10)
+        self.sync_select_frame.grid_columnconfigure(0, weight=1)
+        self.sync_select_frame.grid_rowconfigure(1, weight=1)
+
+        controls = tk.Frame(self.sync_select_frame, bg=self.bg_color)
+        controls.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        controls.grid_columnconfigure(2, weight=1)
+
+        self.sync_scan_btn = RoundedButton(
+            controls, text="↻ Rescan", command=self._scan_sync_items,
+            radius=14, bg_color=self.gray_bg, hover_color=self.gray_hover,
+            text_color=self.text_color, font=(self.font_family, 10, "bold"),
+            width=100, height=32,
+        )
+        self.sync_scan_btn.grid(row=0, column=0, sticky="w", padx=(0, 6))
+
+        self.sync_select_all_btn = RoundedButton(
+            controls, text="Select All", command=self._sync_select_all,
+            radius=14, bg_color=self.gray_bg, hover_color=self.gray_hover,
+            text_color=self.text_color, font=(self.font_family, 10, "bold"),
+            width=100, height=32,
+        )
+        self.sync_select_all_btn.grid(row=0, column=1, sticky="w")
+
+        self.sync_count_label = tk.Label(
+            controls, text="", bg=self.bg_color, fg="#86868B",
+            font=(self.font_family, 10), anchor="e",
+        )
+        self.sync_count_label.grid(row=0, column=2, sticky="e")
+
+        # Bordered listbox
+        border = tk.Frame(self.sync_select_frame, bg="#D2D2D7")
+        border.grid(row=1, column=0, sticky="nsew")
+        border.grid_columnconfigure(0, weight=1)
+        border.grid_rowconfigure(0, weight=1)
+
+        self.sync_listbox = tk.Listbox(
+            border, selectmode=tk.EXTENDED, activestyle="none",
+            font=(self.font_family, 10), bg="white", fg=self.text_color,
+            selectbackground=self.accent_color, selectforeground="white",
+            relief=tk.FLAT, bd=0, highlightthickness=0,
+        )
+        self.sync_listbox.grid(row=0, column=0, sticky="nsew", padx=1, pady=1)
+        lb_scroll = tk.Scrollbar(border, command=self.sync_listbox.yview)
+        lb_scroll.grid(row=0, column=1, sticky="ns")
+        self.sync_listbox.config(yscrollcommand=lb_scroll.set)
+
+        self._build_sync_button_row(parent, row=3)
+
+    def _build_sync_button_row(self, parent: tk.Frame, row: int) -> None:
+        frame = tk.Frame(parent, bg=self.bg_color)
+        frame.grid(row=row, column=0, sticky="ew", pady=(8, 16), padx=10)
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_columnconfigure(1, weight=1)
+
+        self.sync_btn = RoundedButton(
+            frame, text="🔄  Start Sync", command=self.start_sync,
+            radius=22, bg_color=self.accent_color, hover_color=self.accent_hover,
+            text_color="white", font=(self.font_family, 12, "bold"), height=46,
+        )
+        self.sync_btn.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+
+        self.sync_cancel_btn = RoundedButton(
+            frame, text="Cancel", command=self.cancel_download,
+            radius=22, bg_color="#FF3B30", hover_color="#D70A01",
+            text_color="white", font=(self.font_family, 12, "bold"), height=46,
+        )
+        self.sync_cancel_btn.grid(row=0, column=1, sticky="ew")
+        self.sync_cancel_btn.config_state("disabled", bg="#E5E5EA")
 
     def _build_trans_cookie_row(self, parent: tk.Frame, row: int) -> None:
         # Cookie row for transcription (Now tab-specific)
@@ -1406,6 +1515,212 @@ class AppleStyleApp:
         return None
 
     # ------------------------------------------------------------------
+    # Sync Tab Logic
+    # ------------------------------------------------------------------
+    def _scan_sync_items(self) -> None:
+        """Find .srt files in the download folder that have a matching audio
+        source (Dub folder preferred, else the downloaded video)."""
+        if self.downloading:
+            return
+        self.sync_items = []
+        self.sync_listbox.delete(0, tk.END)
+
+        dl_dir = self.downloads_dir
+        dub_dir = Path(self.dub_dir) if self.dub_dir else None
+        srt_files = sorted(dl_dir.glob("*.srt")) if dl_dir.exists() else []
+
+        for srt in srt_files:
+            stem = srt.stem
+            title = stem[: -len(SRT_TITLE_SUFFIX)] if stem.endswith(SRT_TITLE_SUFFIX) else stem
+
+            audio_path: Optional[str] = None
+            kind = ""
+            if dub_dir and dub_dir.exists():
+                for ext in DUB_AUDIO_EXTENSIONS:
+                    candidate = dub_dir / f"{title}{ext}"
+                    if candidate.exists():
+                        audio_path, kind = str(candidate), "Dub"
+                        break
+            if not audio_path:
+                video = dl_dir / f"{title}.mp4"
+                if video.exists():
+                    audio_path, kind = str(video), "Video"
+
+            if audio_path:
+                self.sync_items.append({
+                    "title": title, "srt_path": srt, "audio_path": audio_path, "kind": kind,
+                })
+                self.sync_listbox.insert(tk.END, f"{title}    [{kind}]")
+
+        count = len(self.sync_items)
+        self.sync_count_label.config(text=f"{count} syncable item(s) found")
+        if count == 0:
+            self.log("-> Sync: no .srt files with a matching Dub/Video audio source were found.")
+
+    def _sync_select_all(self) -> None:
+        if self.sync_items:
+            self.sync_listbox.select_set(0, tk.END)
+
+    def start_sync(self) -> None:
+        """Start button on the Sync tab (doubles as 'Finish & Return')."""
+        if self.downloading and self.sync_btn.text == "Finish & Return":
+            self.reset_ui()
+            return
+        if self.downloading:
+            return
+
+        if not self.sync_items:
+            messagebox.showinfo("Sync", "No syncable items found. Add a .srt + its Dub/Video, then Rescan.")
+            return
+
+        selected = self.sync_listbox.curselection()
+        if selected:
+            chosen = [self.sync_items[i] for i in selected]
+        else:
+            if not messagebox.askyesno(
+                "Sync All", "No items selected. Sync ALL listed items?",
+            ):
+                return
+            chosen = list(self.sync_items)
+
+        with self._state_lock:
+            self.downloading = True
+            self.cancelled = False
+        self.cancelled_indices = set()
+        with self.errors_lock:
+            self.batch_errors = []
+
+        self.sync_btn.config_state("disabled", text="Syncing...", bg="#A1C6EA")
+        self.sync_cancel_btn.config_state("normal", bg="#FF3B30")
+        self.sync_scan_btn.config_state("disabled", bg="#E5E5EA")
+
+        self.log_text.config(state="normal")
+        self.log_text.delete("1.0", tk.END)
+        self.log_text.config(state="disabled")
+
+        self.sync_select_frame.grid_remove()
+        self._sync_chosen = chosen
+        titles = [it["title"] for it in chosen]
+        self.sync_manager = DownloadManager(
+            self.sync_tab, titles,
+            self._cancel_single_item,
+            self._sync_retry_item,
+            self._sync_skip_item,
+            None,
+            self.bg_color, self.text_color, self.accent_color, self.font_family,
+        )
+        self.sync_manager.grid(row=2, column=0, sticky="nsew", pady=(0, 15))
+
+        threading.Thread(target=self._sync_process, args=(chosen,), daemon=True).start()
+
+    def _sync_process(self, chosen: List[dict]) -> None:
+        self.log(f"\n--- Starting Subtitle Sync ({len(chosen)} item(s)) ---")
+        aligner = WhisperAligner.try_create(self.log)
+        if aligner is None:
+            self.log("[!] Whisper is not available; cannot sync. Install the Whisper dependencies.")
+            self.root.after(0, self.reset_ui)
+            return
+
+        try:
+            for index, item in enumerate(chosen):
+                if self._is_cancelled():
+                    break
+                self._sync_item_worker(index, item, aligner)
+            with self.errors_lock:
+                if self.batch_errors:
+                    self._save_errors(self.batch_errors, target_dir=self.downloads_dir)
+        except Exception as e:
+            logger.exception("Subtitle sync crashed")
+            self.log(f"\nAn error occurred during sync: {e}")
+        finally:
+            has_failures = False
+            if self.sync_manager:
+                for it in self.sync_manager.items:
+                    if it.status_label["text"] in ("Failed", "Failed (Retry)"):
+                        has_failures = True
+                        break
+            if not self._is_cancelled():
+                if has_failures:
+                    self.log("\nSync finished with errors. You can Retry or Skip items, or Finish & Return.")
+                else:
+                    self.log("\n--- Subtitle Sync Complete ---")
+                self.root.after(0, lambda: self.sync_btn.config_state("normal", text="Finish & Return", bg="#34C759"))
+            else:
+                self.log("\nSync cancelled by user.")
+                self.root.after(0, self.reset_ui)
+
+    def _sync_item_worker(self, index: int, item: dict, aligner: WhisperAligner, is_retry: bool = False) -> bool:
+        if self._is_cancelled() or index in self.cancelled_indices:
+            return False
+
+        title = item["title"]
+        status = "Retrying..." if is_retry else "Active"
+        if self.sync_manager:
+            self.root.after(0, self.sync_manager.set_item_status, index, status, self.accent_color)
+
+        self.log(f"\n[{index + 1}] Syncing: {title}  (audio: {item['kind']})")
+        cues = read_srt_cues(item["srt_path"])
+        if not cues:
+            self.log(f"-> No subtitle text found in {Path(item['srt_path']).name}; skipping.")
+            logger.error("Sync: empty/unreadable SRT for %r (%s)", title, item["srt_path"])
+            if self.sync_manager:
+                self.root.after(0, self.sync_manager.set_item_status, index, "Failed", "#FF3B30")
+            with self.errors_lock:
+                self.batch_errors.append(f"Sync Error for '{title}': no readable subtitle text")
+            return False
+
+        try:
+            ok = aligner.align(
+                item["audio_path"], cues, item["srt_path"], is_cancelled=self._is_cancelled,
+            )
+        except Exception as e:
+            logger.exception("Whisper sync failed for %s", title)
+            self.log(f"-> Error during sync: {e}")
+            if self.sync_manager:
+                self.root.after(0, self.sync_manager.set_item_status, index, "Failed", "#FF3B30")
+            with self.errors_lock:
+                self.batch_errors.append(f"Sync Error for '{title}': {e}")
+            return False
+
+        if self._is_cancelled():
+            return False
+
+        if ok:
+            self.log(f"-> Synced: {title}")
+            if self.sync_manager:
+                self.root.after(0, self.sync_manager.set_item_status, index, "Finished", "#34C759")
+            return True
+        else:
+            self.log(f"-> Sync failed: {title}")
+            if self.sync_manager:
+                self.root.after(0, self.sync_manager.set_item_status, index, "Failed", "#FF3B30")
+            with self.errors_lock:
+                self.batch_errors.append(f"Sync Error for '{title}': alignment returned no result")
+            return False
+
+    def _sync_retry_item(self, index: int) -> None:
+        if not self._sync_chosen or index >= len(self._sync_chosen):
+            return
+        self.cancelled_indices.discard(index)
+        item = self._sync_chosen[index]
+
+        def _worker():
+            aligner = WhisperAligner.try_create(self.log)
+            if aligner is None:
+                if self.sync_manager:
+                    self.root.after(0, self.sync_manager.set_item_status, index, "Failed (AI Init)", "#FF3B30")
+                return
+            self._sync_item_worker(index, item, aligner, is_retry=True)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _sync_skip_item(self, index: int) -> None:
+        with self._state_lock:
+            if self.sync_manager:
+                self.sync_manager.set_item_status(index, "Skipped", "#34C759")
+            self.log(f"-> Sync item marked as skipped: {index + 1}")
+
+    # ------------------------------------------------------------------
     # Transcription Tab Logic
     # ------------------------------------------------------------------
 
@@ -1740,23 +2055,40 @@ class AppleStyleApp:
         self.groq_key_entry.entry.config(state="normal")
         if hasattr(self, "trans_border"):
             self.trans_border.grid()
-            
+
+        # Reset Sync Tab Buttons
+        if hasattr(self, "sync_btn"):
+            self.sync_btn.config_state("normal", text="🔄  Start Sync", bg=self.accent_color)
+            self.sync_cancel_btn.config_state("disabled", bg="#E5E5EA")
+            self.sync_scan_btn.config_state("normal", bg=self.gray_bg)
+        if hasattr(self, "sync_select_frame"):
+            self.sync_select_frame.grid()
+
         # Clean up managers
         if hasattr(self, "download_manager") and self.download_manager:
             self.download_manager.destroy()
             self.download_manager = None
-            
+
         if hasattr(self, "trans_manager") and self.trans_manager:
             self.trans_manager.destroy()
             self.trans_manager = None
+
+        if hasattr(self, "sync_manager") and self.sync_manager:
+            self.sync_manager.destroy()
+            self.sync_manager = None
             
         self.dl_input_text.config(state="normal", bg="white")
         self.trans_input_text.config(state="normal", bg="white")
         
+        # If we returned to the Sync tab, refresh the list so freshly-synced
+        # files are reflected.
+        if getattr(self, "_active_tab", None) == "sync":
+            self._scan_sync_items()
+
         # Force focus back to the active tab's input area
         if hasattr(self, "btn_dl_tab") and self.btn_dl_tab.text_color == self.accent_color:
             self.dl_input_text.focus_set()
-        else:
+        elif getattr(self, "_active_tab", None) != "sync":
             self.trans_input_text.focus_set()
 
 

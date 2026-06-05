@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import requests
 import shutil
 import subprocess
@@ -38,6 +39,35 @@ def format_time(seconds: float) -> str:
     secs = int(seconds % 60)
     ms = int((seconds % 1) * 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
+
+
+def read_srt_cues(path: Path) -> List[str]:
+    """Parse an existing .srt file back into its cue text lines.
+
+    Each returned entry is one cue's text (multi-line cues are joined with a
+    space), preserving order so the result can be fed straight back into
+    :meth:`WhisperAligner.align` to re-time it against an audio track.
+    """
+    try:
+        raw = Path(path).read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return []
+
+    cues: List[str] = []
+    for block in re.split(r"\n\s*\n", raw.strip()):
+        text_lines: List[str] = []
+        for i, line in enumerate(block.splitlines()):
+            s = line.strip()
+            if not s:
+                continue
+            if "-->" in s:          # timestamp line
+                continue
+            if i == 0 and s.isdigit():  # leading cue index
+                continue
+            text_lines.append(s)
+        if text_lines:
+            cues.append(" ".join(text_lines))
+    return cues
 
 
 def generate_standard_srt(
