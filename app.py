@@ -180,7 +180,10 @@ class AppleStyleApp:
 
     def _build_dl_tab(self, parent: tk.Frame) -> None:
         parent.grid_columnconfigure(0, weight=1)
-        parent.grid_rowconfigure(2, weight=1)
+        # minsize keeps the input visible on first paint: row 2 is the only
+        # weighted row, so without a floor it absorbs all the layout shrink and
+        # collapses to ~0px until the user resizes the window.
+        parent.grid_rowconfigure(2, weight=1, minsize=160)
 
         tk.Label(
             parent, text="Batch Video Downloader", bg=self.bg_color, fg=self.text_color,
@@ -207,6 +210,7 @@ class AppleStyleApp:
             inner, wrap=tk.WORD, font=(self.font_family, 11),
             bg="white", fg=self.text_color, insertbackground=self.accent_color,
             relief=tk.FLAT, padx=10, pady=10, undo=True,
+            height=6, width=1,  # small request; grid weight lets it expand
         )
         self.dl_input_text.grid(row=0, column=0, sticky="nsew")
 
@@ -225,7 +229,7 @@ class AppleStyleApp:
 
     def _build_trans_tab(self, parent: tk.Frame) -> None:
         parent.grid_columnconfigure(0, weight=1)
-        parent.grid_rowconfigure(2, weight=1)
+        parent.grid_rowconfigure(2, weight=1, minsize=160)
 
         tk.Label(
             parent, text="Batch Transcription", bg=self.bg_color, fg=self.text_color,
@@ -251,6 +255,7 @@ class AppleStyleApp:
             inner, wrap=tk.WORD, font=(self.font_family, 11),
             bg="white", fg=self.text_color, insertbackground=self.accent_color,
             relief=tk.FLAT, padx=10, pady=10, undo=True,
+            height=6, width=1,  # small request; grid weight lets it expand
         )
         self.trans_input_text.grid(row=0, column=0, sticky="nsew")
 
@@ -288,22 +293,42 @@ class AppleStyleApp:
         menu.add_command(label="Copy", command=lambda: widget.event_generate("<<Copy>>"))
         menu.add_command(label="Paste", command=lambda: widget.event_generate("<<Paste>>"))
         menu.add_separator()
-        menu.add_command(label="Select All", command=lambda: widget.tag_add(tk.SEL, "1.0", tk.END))
+        menu.add_command(label="Select All", command=lambda: widget.tag_add(tk.SEL, "1.0", "end-1c"))
         
         def show_menu(event):
             widget.focus_set()
             menu.tk_popup(event.x_root, event.y_root)
         
         widget.bind("<Button-3>", show_menu)
-        
-        # Explicitly bind standard keyboard shortcuts for robustness
-        # Returning "break" prevents the event from being handled twice by Tkinter's default bindings.
-        widget.bind("<Control-v>", lambda e: (widget.event_generate("<<Paste>>"), "break")[1])
-        widget.bind("<Control-c>", lambda e: (widget.event_generate("<<Copy>>"), "break")[1])
-        widget.bind("<Control-x>", lambda e: (widget.event_generate("<<Cut>>"), "break")[1])
-        widget.bind("<Control-a>", lambda e: (widget.tag_add(tk.SEL, "1.0", tk.END), "break")[1])
-        widget.bind("<Control-z>", lambda e: (widget.event_generate("<<Undo>>"), "break")[1])
-        widget.bind("<Control-y>", lambda e: (widget.event_generate("<<Redo>>"), "break")[1])
+
+        # Keyboard shortcuts. We dispatch on the physical key (keycode) in
+        # addition to the keysym so Cut/Copy/Paste/Select-All keep working under
+        # non-Latin keyboard layouts (e.g. Persian), where Ctrl+C does not emit
+        # the "c" keysym and the default English bindings silently fail.
+        # Returning "break" stops Tk's default class binding from also firing.
+        def handle_shortcut(event):
+            if not (event.state & 0x4):  # Control held (mask is 0x4 on Win/X11)
+                return None
+            key = (event.keysym or "").lower()
+            code = event.keycode  # Windows virtual key codes (layout-independent)
+            if key == "c" or code == 67:        # C
+                widget.event_generate("<<Copy>>")
+            elif key == "v" or code == 86:      # V
+                widget.event_generate("<<Paste>>")
+            elif key == "x" or code == 88:      # X
+                widget.event_generate("<<Cut>>")
+            elif key == "a" or code == 65:      # A
+                widget.tag_add(tk.SEL, "1.0", "end-1c")
+                widget.mark_set(tk.INSERT, "1.0")
+            elif key == "z" or code == 90:      # Z
+                widget.event_generate("<<Undo>>")
+            elif key == "y" or code == 89:      # Y
+                widget.event_generate("<<Redo>>")
+            else:
+                return None
+            return "break"
+
+        widget.bind("<Control-KeyPress>", handle_shortcut)
 
     def _truncate(self, text: str, width: int, font: Tuple) -> str:
         """Truncate text to fit a pixel width using ellipsis."""
