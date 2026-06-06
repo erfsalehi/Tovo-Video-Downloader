@@ -31,6 +31,7 @@ URL_PREFIXES = ("http://", "https://")
 INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 DOWNLOAD_FILE_EXTENSIONS = (".mp4", ".srt", ".txt", ".mp3", ".wav", ".m4a")
 SRT_TITLE_SUFFIX = " (SRT)"  # how _maybe_generate_srt names SRT files
+SYNCED_SRT_SUFFIX = " (Synced)"  # Sync tab writes a new file, keeps the original
 DUB_AUDIO_EXTENSIONS = (".mp3", ".wav", ".m4a", ".mp4")
 PROCESS_TERMINATE_TIMEOUT = 5  # seconds before SIGKILL fallback
 
@@ -307,7 +308,8 @@ class AppleStyleApp:
         tk.Label(
             parent,
             text="Re-time existing .srt files against the voiceover (Dub folder) or the "
-                 "downloaded video. Picks the Dub track when available.",
+                 "downloaded video. Picks the Dub track when available. Saves a new "
+                 "“ (Synced).srt” and keeps the original.",
             bg=self.bg_color, fg="#86868B", font=(self.font_family, 10), justify="left",
         ).grid(row=1, column=0, sticky="w", pady=(0, 8), padx=10)
 
@@ -1531,6 +1533,8 @@ class AppleStyleApp:
 
         for srt in srt_files:
             stem = srt.stem
+            if stem.endswith(SYNCED_SRT_SUFFIX):  # don't re-sync our own output
+                continue
             title = stem[: -len(SRT_TITLE_SUFFIX)] if stem.endswith(SRT_TITLE_SUFFIX) else stem
 
             audio_path: Optional[str] = None
@@ -1669,9 +1673,13 @@ class AppleStyleApp:
                 self.batch_errors.append(f"Sync Error for '{title}': no readable subtitle text")
             return False
 
+        # Write a new file and leave the original .srt untouched.
+        src_srt = Path(item["srt_path"])
+        out_srt = src_srt.with_name(f"{title}{SYNCED_SRT_SUFFIX}.srt")
+
         try:
             ok = aligner.align(
-                item["audio_path"], cues, item["srt_path"], is_cancelled=self._is_cancelled,
+                item["audio_path"], cues, out_srt, is_cancelled=self._is_cancelled,
             )
         except Exception as e:
             logger.exception("Whisper sync failed for %s", title)
@@ -1686,7 +1694,7 @@ class AppleStyleApp:
             return False
 
         if ok:
-            self.log(f"-> Synced: {title}")
+            self.log(f"-> Synced: {title}  ->  {out_srt.name} (original kept)")
             if self.sync_manager:
                 self.root.after(0, self.sync_manager.set_item_status, index, "Finished", "#34C759")
             return True
