@@ -21,6 +21,18 @@ DEFAULTS: dict[str, Any] = {
     "use_tv_client": False,
     "proxy_url": "",
     "last_yt_dlp_update_check": "",
+    "export_ttml": False,
+    "caption_style": {
+        "font_family": "Arial",
+        "font_size": 36,
+        "x_offset": 0,
+        "y_offset": 360,
+        "text_color": "#FFFFFF",
+        "bg_color": "#000000",
+        "bg_opacity": 70,
+        "padding": 12,
+        "corner_radius": 8,
+    },
 }
 
 

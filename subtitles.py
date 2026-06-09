@@ -1,6 +1,7 @@
 """SRT generation and Whisper-based subtitle alignment."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -8,8 +9,9 @@ import re
 import requests
 import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +92,201 @@ def generate_standard_srt(
     except OSError as e:
         log(f"-> Error creating SRT: {e}")
         return False
+
+
+# ----------------------------------------------------------------------
+# Styled caption export (.ttml)
+# ----------------------------------------------------------------------
+
+# Reference frame the style offsets are authored against. Premiere scales the
+# region to the actual sequence size on import, so the numbers stay meaningful
+# regardless of the final timeline resolution.
+TTML_REFERENCE_RESOLUTION: Tuple[int, int] = (1920, 1080)
+
+
+@dataclass
+class CaptionStyle:
+    """Visual style for exported .ttml captions, persisted in config.json.
+
+    Offsets are measured in reference-frame pixels from the *centre* of the
+    frame: ``x_offset`` positive moves right, ``y_offset`` positive moves down
+    (so a positive ``y_offset`` lands in the familiar lower-third zone).
+    """
+
+    font_family: str = "Arial"
+    font_size: int = 36          # px in the reference frame
+    x_offset: int = 0            # px from horizontal centre (+ = right)
+    y_offset: int = 360          # px from vertical centre (+ = down)
+    text_color: str = "#FFFFFF"
+    bg_color: str = "#000000"
+    bg_opacity: int = 70         # percent (0 = transparent, 100 = opaque)
+    padding: int = 12            # px of background around the text
+    corner_radius: int = 8       # px; honoured by the overlay export, not TTML
+
+    @classmethod
+    def from_dict(cls, data: Optional[dict]) -> "CaptionStyle":
+        if not isinstance(data, dict):
+            return cls()
+        valid = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in valid})
+
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+    def bg_color_rgba(self) -> str:
+        """Return the background colour as ``#RRGGBBAA`` using ``bg_opacity``."""
+        alpha = round(max(0, min(100, int(self.bg_opacity))) * 255 / 100)
+        hexcol = str(self.bg_color).lstrip("#")
+        if len(hexcol) == 3:
+            hexcol = "".join(c * 2 for c in hexcol)
+        if len(hexcol) != 6:
+            hexcol = "000000"
+        return f"#{hexcol.upper()}{alpha:02X}"
+
+
+_SRT_TIME_RE = re.compile(r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})")
+
+
+def _srt_time_to_seconds(text: str) -> float:
+    m = _SRT_TIME_RE.search(text)
+    if not m:
+        return 0.0
+    h, mm, ss, ms = m.groups()
+    return int(h) * 3600 + int(mm) * 60 + int(ss) + int(ms.ljust(3, "0")) / 1000.0
+
+
+def parse_srt_timed(path: Path) -> List[Tuple[float, float, List[str]]]:
+    """Parse an .srt into ``(start, end, [text_line, ...])`` tuples.
+
+    Unlike :func:`read_srt_cues`, this keeps the cue timing so the captions can
+    be re-emitted in another format without re-running alignment.
+    """
+    try:
+        raw = Path(path).read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return []
+
+    cues: List[Tuple[float, float, List[str]]] = []
+    for block in re.split(r"\n\s*\n", raw.strip()):
+        lines = block.splitlines()
+        time_idx = next((i for i, ln in enumerate(lines) if "-->" in ln), None)
+        if time_idx is None:
+            continue
+        start_part, _, end_part = lines[time_idx].partition("-->")
+        start = _srt_time_to_seconds(start_part)
+        end = _srt_time_to_seconds(end_part)
+        text_lines = [ln.strip() for ln in lines[time_idx + 1:] if ln.strip()]
+        if text_lines:
+            cues.append((start, end, text_lines))
+    return cues
+
+
+def _ttml_time(seconds: float) -> str:
+    """Format seconds as a TTML media clock time ``HH:MM:SS.mmm``."""
+    if seconds < 0:
+        seconds = 0.0
+    total_ms = int(round(seconds * 1000))
+    ms = total_ms % 1000
+    total_s = total_ms // 1000
+    hours = total_s // 3600
+    minutes = (total_s % 3600) // 60
+    secs = total_s % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{ms:03d}"
+
+
+def _xml_escape(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def write_ttml(
+    srt_path: Path,
+    style: CaptionStyle,
+    log: LogFn,
+    ttml_path: Optional[Path] = None,
+    resolution: Tuple[int, int] = TTML_REFERENCE_RESOLUTION,
+) -> bool:
+    """Convert a finished .srt into a styled W3C TTML caption file.
+
+    The text sits in a positioned region (origin derived from the style's
+    centre-relative offsets) with a text-hugging background span, giving an
+    SRT-like overlay that Premiere imports with its position, font, colours and
+    background intact.
+    """
+    srt_path = Path(srt_path)
+    if ttml_path is None:
+        ttml_path = srt_path.with_suffix(".ttml")
+    ttml_path = Path(ttml_path)
+
+    cues = parse_srt_timed(srt_path)
+    if not cues:
+        log(f"-> No cues to export to TTML from {srt_path.name}.")
+        return False
+
+    width, height = resolution
+    region_w = int(width * 0.8)
+    region_h = int(height * 0.25)
+    centre_x = width / 2 + style.x_offset
+    centre_y = height / 2 + style.y_offset
+    origin_x = int(round(centre_x - region_w / 2))
+    origin_y = int(round(centre_y - region_h / 2))
+    origin_x = max(0, min(width - region_w, origin_x))
+    origin_y = max(0, min(height - region_h, origin_y))
+
+    font_family = _xml_escape(str(style.font_family) or "Arial")
+    bg_rgba = style.bg_color_rgba()
+
+    header = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!-- Generated by Tovo Video Downloader. corner-radius: {int(style.corner_radius)}px
+     is honoured by the transparent-overlay export, not by TTML captions. -->
+<tt xmlns="http://www.w3.org/ns/ttml"
+    xmlns:tts="http://www.w3.org/ns/ttml#styling"
+    xmlns:ttp="http://www.w3.org/ns/ttml#parameter"
+    ttp:timeBase="media"
+    xml:lang="en"
+    tts:extent="{width}px {height}px">
+  <head>
+    <styling>
+      <style xml:id="capStyle"
+             tts:fontFamily="{font_family}"
+             tts:fontSize="{int(style.font_size)}px"
+             tts:color="{style.text_color}"
+             tts:backgroundColor="{bg_rgba}"
+             tts:padding="{int(style.padding)}px"
+             tts:textAlign="center"/>
+    </styling>
+    <layout>
+      <region xml:id="capRegion"
+              tts:origin="{origin_x}px {origin_y}px"
+              tts:extent="{region_w}px {region_h}px"
+              tts:displayAlign="center"
+              tts:textAlign="center"/>
+    </layout>
+  </head>
+  <body>
+    <div>
+"""
+
+    lines = [header]
+    for start, end, text_lines in cues:
+        content = "<br/>".join(_xml_escape(ln) for ln in text_lines)
+        lines.append(
+            f'      <p begin="{_ttml_time(start)}" end="{_ttml_time(end)}"'
+            f' style="capStyle" region="capRegion">{content}</p>\n'
+        )
+    lines.append("    </div>\n  </body>\n</tt>\n")
+
+    try:
+        ttml_path.write_text("".join(lines), encoding="utf-8")
+    except OSError as e:
+        log(f"-> Error creating TTML: {e}")
+        return False
+
+    log(f"-> Created styled TTML: {ttml_path.name} ({len(cues)} cues).")
+    return True
 
 
 class WhisperAligner:

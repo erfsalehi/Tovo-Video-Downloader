@@ -11,7 +11,7 @@ import threading
 import tkinter as tk
 from collections import deque
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, ttk
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
@@ -19,7 +19,10 @@ from logging.handlers import RotatingFileHandler
 from config import Config
 from dependencies import find_missing_tools, install_all, update_yt_dlp
 import requests
-from subtitles import WhisperAligner, GroqTranscriber, generate_standard_srt, read_srt_cues
+from subtitles import (
+    WhisperAligner, GroqTranscriber, generate_standard_srt, read_srt_cues,
+    CaptionStyle, write_ttml,
+)
 from widgets import DownloadManager, RoundedButton, RoundedEntry, ModernCheckbutton, RoundedFrame
 
 logger = logging.getLogger(__name__)
@@ -525,6 +528,21 @@ class AppleStyleApp:
             state="readonly", font=(self.font_family, 10), width=22,
         ).pack(side=tk.LEFT)
 
+        # Optional styled .ttml export alongside every generated .srt.
+        self.export_ttml_var = tk.BooleanVar(value=self.config.get("export_ttml", False))
+        ModernCheckbutton(
+            frame, text="Also export styled .ttml",
+            variable=self.export_ttml_var, bg_color=self.bg_color,
+            command=self._save_config, canvas_width=190,
+        ).pack(side=tk.LEFT, padx=(16, 0))
+
+        RoundedButton(
+            frame, text="Caption Style…", command=self._open_caption_style_dialog,
+            radius=14, bg_color=self.gray_bg, hover_color=self.gray_hover,
+            text_color=self.text_color, font=(self.font_family, 10, "bold"),
+            width=120, height=32,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+
     def _build_dl_concurrent_row(self, parent: tk.Frame, row: int) -> None:
         frame = tk.Frame(parent, bg=self.bg_color)
         frame.grid(row=row, column=0, sticky="ew", pady=(0, 10), padx=10)
@@ -761,6 +779,7 @@ class AppleStyleApp:
         self.config.set("trans_concurrent", self.trans_concurrent_var.get())
         self.config.set("trans_max_concurrent", self.trans_max_concurrent_var.get())
         self.config.set("trans_use_browser_cookies", self.trans_use_browser_cookies.get())
+        self.config.set("export_ttml", self.export_ttml_var.get())
         self.config.save()
 
     def browse_directory(self) -> None:
@@ -1505,6 +1524,148 @@ class AppleStyleApp:
         if not whisper_success and not self._is_cancelled():
             generate_standard_srt(subs, srt_path, self.log)
 
+        self._maybe_export_ttml(srt_path)
+
+    def _maybe_export_ttml(self, srt_path: Path) -> None:
+        """Emit a sibling styled .ttml when the export toggle is on."""
+        if not self.export_ttml_var.get():
+            return
+        if not Path(srt_path).exists():
+            return
+        try:
+            style = CaptionStyle.from_dict(self.config.get("caption_style"))
+            write_ttml(srt_path, style, self.log)
+        except Exception as e:
+            logger.exception("TTML export failed for %s", srt_path)
+            self.log(f"-> Warning: could not export .ttml: {e}")
+
+    def _open_caption_style_dialog(self) -> None:
+        """Edit and persist the CaptionStyle used for every .ttml export."""
+        style = CaptionStyle.from_dict(self.config.get("caption_style"))
+
+        win = tk.Toplevel(self.root)
+        win.title("Caption Style (.ttml)")
+        win.configure(bg=self.bg_color)
+        win.transient(self.root)
+        win.resizable(False, False)
+        win.grab_set()
+
+        pad = {"padx": 12, "pady": 6}
+        body = tk.Frame(win, bg=self.bg_color)
+        body.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+
+        def _label(row: int, text: str) -> None:
+            tk.Label(
+                body, text=text, bg=self.bg_color, fg=self.text_color,
+                font=(self.font_family, 10), anchor="w",
+            ).grid(row=row, column=0, sticky="w", **pad)
+
+        # --- numeric / text fields -------------------------------------
+        font_var = tk.StringVar(value=style.font_family)
+        size_var = tk.IntVar(value=style.font_size)
+        x_var = tk.IntVar(value=style.x_offset)
+        y_var = tk.IntVar(value=style.y_offset)
+        opacity_var = tk.IntVar(value=style.bg_opacity)
+        padding_var = tk.IntVar(value=style.padding)
+        radius_var = tk.IntVar(value=style.corner_radius)
+        text_color_var = tk.StringVar(value=style.text_color)
+        bg_color_var = tk.StringVar(value=style.bg_color)
+
+        _label(0, "Font family")
+        ttk.Combobox(
+            body, textvariable=font_var, width=22, font=(self.font_family, 10),
+            values=["Arial", "Helvetica", "Segoe UI", "Times New Roman",
+                    "Verdana", "Tahoma", "Georgia", "Calibri", "Courier New"],
+        ).grid(row=0, column=1, columnspan=2, sticky="w", **pad)
+
+        _label(1, "Font size (px)")
+        tk.Spinbox(body, from_=8, to=200, textvariable=size_var, width=6,
+                   font=(self.font_family, 10)).grid(row=1, column=1, sticky="w", **pad)
+
+        _label(2, "X offset from centre (px)")
+        tk.Spinbox(body, from_=-960, to=960, textvariable=x_var, width=6,
+                   font=(self.font_family, 10)).grid(row=2, column=1, sticky="w", **pad)
+
+        _label(3, "Y offset from centre (px)")
+        tk.Spinbox(body, from_=-540, to=540, textvariable=y_var, width=6,
+                   font=(self.font_family, 10)).grid(row=3, column=1, sticky="w", **pad)
+
+        # --- colour swatches -------------------------------------------
+        def _make_swatch(row: int, label: str, var: tk.StringVar) -> None:
+            _label(row, label)
+            swatch = tk.Label(body, bg=var.get(), width=4, relief=tk.SOLID, bd=1)
+            swatch.grid(row=row, column=1, sticky="w", **pad)
+
+            def _pick() -> None:
+                chosen = colorchooser.askcolor(color=var.get(), parent=win)[1]
+                if chosen:
+                    var.set(chosen)
+                    swatch.config(bg=chosen)
+
+            RoundedButton(
+                body, text="Pick…", command=_pick, radius=12,
+                bg_color=self.gray_bg, hover_color=self.gray_hover,
+                text_color=self.text_color, font=(self.font_family, 9, "bold"),
+                width=70, height=28,
+            ).grid(row=row, column=2, sticky="w", **pad)
+
+        _make_swatch(4, "Text colour", text_color_var)
+        _make_swatch(5, "Background colour", bg_color_var)
+
+        _label(6, "Background opacity (%)")
+        tk.Spinbox(body, from_=0, to=100, textvariable=opacity_var, width=6,
+                   font=(self.font_family, 10)).grid(row=6, column=1, sticky="w", **pad)
+
+        _label(7, "Background padding (px)")
+        tk.Spinbox(body, from_=0, to=100, textvariable=padding_var, width=6,
+                   font=(self.font_family, 10)).grid(row=7, column=1, sticky="w", **pad)
+
+        _label(8, "Corner radius (px)")
+        tk.Spinbox(body, from_=0, to=100, textvariable=radius_var, width=6,
+                   font=(self.font_family, 10)).grid(row=8, column=1, sticky="w", **pad)
+
+        tk.Label(
+            body,
+            text="Note: Premiere TTML captions honour font, size, position and\n"
+                 "colours. Corner radius is saved for the overlay export but is\n"
+                 "not represented in TTML captions.",
+            bg=self.bg_color, fg="#86868B", font=(self.font_family, 8),
+            justify="left", anchor="w",
+        ).grid(row=9, column=0, columnspan=3, sticky="w", **pad)
+
+        # --- save / cancel ---------------------------------------------
+        def _save_and_close() -> None:
+            new_style = CaptionStyle(
+                font_family=font_var.get().strip() or "Arial",
+                font_size=int(size_var.get()),
+                x_offset=int(x_var.get()),
+                y_offset=int(y_var.get()),
+                text_color=text_color_var.get(),
+                bg_color=bg_color_var.get(),
+                bg_opacity=int(opacity_var.get()),
+                padding=int(padding_var.get()),
+                corner_radius=int(radius_var.get()),
+            )
+            self.config.set("caption_style", new_style.to_dict())
+            self.config.save()
+            self.log("-> Caption style saved.")
+            win.destroy()
+
+        btn_row = tk.Frame(win, bg=self.bg_color)
+        btn_row.pack(fill=tk.X, padx=12, pady=(0, 12))
+        RoundedButton(
+            btn_row, text="Save", command=_save_and_close, radius=14,
+            bg_color=self.accent_color, hover_color="#4B49C4",
+            text_color="white", font=(self.font_family, 10, "bold"),
+            width=90, height=34,
+        ).pack(side=tk.RIGHT)
+        RoundedButton(
+            btn_row, text="Cancel", command=win.destroy, radius=14,
+            bg_color=self.gray_bg, hover_color=self.gray_hover,
+            text_color=self.text_color, font=(self.font_family, 10, "bold"),
+            width=90, height=34,
+        ).pack(side=tk.RIGHT, padx=(0, 8))
+
     def _get_dub_track(self, title: str) -> Optional[str]:
         if not self.dub_dir:
             return None
@@ -1695,6 +1856,7 @@ class AppleStyleApp:
 
         if ok:
             self.log(f"-> Synced: {title}  ->  {out_srt.name} (original kept)")
+            self._maybe_export_ttml(out_srt)
             if self.sync_manager:
                 self.root.after(0, self.sync_manager.set_item_status, index, "Finished", "#34C759")
             return True
