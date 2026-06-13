@@ -70,6 +70,20 @@ def parse_titles_and_links(text: str):
 class AppleStyleApp:
     """Main GUI window: input pane, options, log, and the download worker."""
 
+    # Max-quality cap → max video height in pixels. "Best Available" (None)
+    # means no cap. Any other value downloads the best stream up to that height
+    # (e.g. a 4K source capped at 1080p downloads 1080p; a 720p-only source
+    # capped at 1080p still downloads 720p).
+    QUALITY_HEIGHTS: Dict[str, Optional[int]] = {
+        "Best Available": None,
+        "2160p (4K)": 2160,
+        "1440p (2K)": 1440,
+        "1080p (Full HD)": 1080,
+        "720p (HD)": 720,
+        "480p": 480,
+        "360p": 360,
+    }
+
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Video Downloader")
@@ -245,11 +259,12 @@ class AppleStyleApp:
         self.dl_input_frame = border  # keep reference for grid_remove
 
         self._build_save_row(parent, row=3)
-        self._build_dl_options_row(parent, row=4)
-        self._build_dl_concurrent_row(parent, row=5)
-        self._build_dub_row(parent, row=6)
-        self._build_advanced_row(parent, row=7)
-        self._build_dl_button_row(parent, row=8)
+        self._build_dl_quality_row(parent, row=4)
+        self._build_dl_options_row(parent, row=5)
+        self._build_dl_concurrent_row(parent, row=6)
+        self._build_dub_row(parent, row=7)
+        self._build_advanced_row(parent, row=8)
+        self._build_dl_button_row(parent, row=9)
 
     def _build_trans_tab(self, parent: tk.Frame) -> None:
         parent.grid_columnconfigure(0, weight=1)
@@ -512,6 +527,34 @@ class AppleStyleApp:
         )
         self.trans_browse_btn.grid(row=0, column=2, sticky="e", padx=(6, 0))
 
+    def _build_dl_quality_row(self, parent: tk.Frame, row: int) -> None:
+        frame = tk.Frame(parent, bg=self.bg_color)
+        frame.grid(row=row, column=0, sticky="ew", pady=(0, 10), padx=10)
+
+        tk.Label(
+            frame, text="Max Quality:", bg=self.bg_color, fg=self.text_color,
+            font=(self.font_family, 10, "bold"),
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        self.max_quality_var = tk.StringVar(
+            value=self.config.get("max_quality", "Best Available")
+        )
+        # Fall back to "Best Available" if a stale/unknown value was persisted.
+        if self.max_quality_var.get() not in self.QUALITY_HEIGHTS:
+            self.max_quality_var.set("Best Available")
+        ttk.Combobox(
+            frame, textvariable=self.max_quality_var,
+            values=list(self.QUALITY_HEIGHTS.keys()),
+            state="readonly", font=(self.font_family, 10), width=16,
+        ).pack(side=tk.LEFT, padx=(0, 12))
+
+        tk.Label(
+            frame, text="Downloads the best available quality up to this limit.",
+            bg=self.bg_color, fg="#86868B", font=(self.font_family, 9),
+        ).pack(side=tk.LEFT)
+
+        self.max_quality_var.trace_add("write", lambda *_: self._save_config())
+
     def _build_dl_options_row(self, parent: tk.Frame, row: int) -> None:
         frame = tk.Frame(parent, bg=self.bg_color)
         frame.grid(row=row, column=0, sticky="ew", pady=(0, 10), padx=10)
@@ -770,6 +813,7 @@ class AppleStyleApp:
         self.config.set("dub_dir", self.dub_dir)
         self.config.set("concurrent_downloads", self.concurrent_var.get())
         self.config.set("max_concurrent", self.max_concurrent_var.get())
+        self.config.set("max_quality", self.max_quality_var.get())
         self.config.set("use_browser_cookies", self.use_browser_cookies.get())
         self.config.set("disable_proxy", self.disable_proxy_var.get())
         self.config.set("use_tv_client", self.use_tv_client_var.get())
@@ -1221,6 +1265,24 @@ class AppleStyleApp:
         with self._state_lock:
             self.active_processes.pop(index, None)
 
+    def _build_format_selector(self) -> str:
+        """yt-dlp ``-f`` selector, optionally capped to a max video height.
+
+        With no cap it keeps the original preference (mp4 video+audio, then any
+        mp4, then anything). With a cap of H it prefers the best stream whose
+        height is ≤ H, and only if nothing qualifies (e.g. every rendition is
+        above the cap) does it fall back to the uncapped best — so the user
+        always gets a file, but never above their chosen limit when avoidable.
+        """
+        height = self.QUALITY_HEIGHTS.get(self.max_quality_var.get())
+        if not height:
+            return "bv[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"
+        h = f"[height<={height}]"
+        return (
+            f"bv{h}[ext=mp4]+ba[ext=m4a]/b{h}[ext=mp4]/b{h}"
+            "/bv[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"
+        )
+
     def _build_yt_dlp_command(self, title: str, link: str) -> List[str]:
         safe_title = sanitize_filename(title)
         output_path = str(self.downloads_dir / f"{safe_title}.%(ext)s")
@@ -1237,7 +1299,7 @@ class AppleStyleApp:
             exe_path,
             "-o", output_path,
             "--no-playlist",
-            "-f", "bv[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
+            "-f", self._build_format_selector(),
             "--merge-output-format", "mp4",
             "--extractor-args", f"youtube:player_client={clients};player_skip=webpage",
             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
