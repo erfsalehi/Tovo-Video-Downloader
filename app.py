@@ -1290,11 +1290,15 @@ class AppleStyleApp:
         yt_dlp_exe = BASE_PATH / "yt-dlp.exe"
         exe_path = str(yt_dlp_exe) if yt_dlp_exe.exists() else "yt-dlp"
 
-        # Determine player clients
-        clients = "android,mweb"
+        # Determine player clients. The old android/mweb clients are now capped
+        # at 360p by YouTube's SABR-only experiment (android HD formats arrive
+        # without URLs) and mweb's GVS PO-token requirement, so the format
+        # selector could only ever pick the 360p progressive stream. web_safari
+        # still returns full HD formats; tv is kept as the bot-detection bypass.
+        clients = "web_safari"
         if self.use_tv_client_var.get():
-            clients = "tv,mweb"
-            
+            clients = "tv,web_safari"
+
         cmd: List[str] = [
             exe_path,
             "-o", output_path,
