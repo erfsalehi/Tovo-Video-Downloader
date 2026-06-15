@@ -1268,20 +1268,20 @@ class AppleStyleApp:
     def _build_format_selector(self) -> str:
         """yt-dlp ``-f`` selector, optionally capped to a max video height.
 
-        With no cap it keeps the original preference (mp4 video+audio, then any
-        mp4, then anything). With a cap of H it prefers the best stream whose
-        height is ≤ H, and only if nothing qualifies (e.g. every rendition is
-        above the cap) does it fall back to the uncapped best — so the user
-        always gets a file, but never above their chosen limit when avoidable.
+        Deliberately permissive on codec/container so high resolutions stay
+        reachable: YouTube only ships 1440p/4K as VP9/AV1, never H.264, so the
+        old ``[ext=mp4]`` lock silently capped every download at 1080p. The
+        ``--format-sort`` and ``--recode-video`` args added in
+        ``_build_yt_dlp_command`` handle editor compatibility — they keep
+        anything ≤1080p as an untouched native H.264 mp4 and re-encode only the
+        higher VP9/AV1 streams to H.264. With a cap of H this takes the best
+        stream ≤ H, falling back to the uncapped best only if nothing qualifies.
         """
         height = self.QUALITY_HEIGHTS.get(self.max_quality_var.get())
         if not height:
-            return "bv[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"
+            return "bv*+ba/b"
         h = f"[height<={height}]"
-        return (
-            f"bv{h}[ext=mp4]+ba[ext=m4a]/b{h}[ext=mp4]/b{h}"
-            "/bv[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"
-        )
+        return f"bv*{h}+ba/b{h}/b"
 
     def _build_yt_dlp_command(self, title: str, link: str) -> List[str]:
         safe_title = sanitize_filename(title)
@@ -1290,14 +1290,15 @@ class AppleStyleApp:
         yt_dlp_exe = BASE_PATH / "yt-dlp.exe"
         exe_path = str(yt_dlp_exe) if yt_dlp_exe.exists() else "yt-dlp"
 
-        # Determine player clients. The old android/mweb clients are now capped
-        # at 360p by YouTube's SABR-only experiment (android HD formats arrive
-        # without URLs) and mweb's GVS PO-token requirement, so the format
-        # selector could only ever pick the 360p progressive stream. web_safari
-        # still returns full HD formats; tv is kept as the bot-detection bypass.
-        clients = "web_safari"
-        if self.use_tv_client_var.get():
-            clients = "tv,web_safari"
+        # Player clients. yt-dlp's default set exposes the full DASH ladder
+        # (incl. 1440p/4K) and avoids both the android/mweb SABR 360p cap and
+        # web_safari's HLS 1080p ceiling. The TV client (bot-detection bypass)
+        # is *added* to the default set, not substituted, so quality reach is
+        # preserved when the toggle is on.
+        extractor_args = (
+            "youtube:player_client=default,tv"
+            if self.use_tv_client_var.get() else None
+        )
 
         cmd: List[str] = [
             exe_path,
@@ -1305,9 +1306,17 @@ class AppleStyleApp:
             "--no-playlist",
             "-f", self._build_format_selector(),
             "--merge-output-format", "mp4",
-            "--extractor-args", f"youtube:player_client={clients};player_skip=webpage",
+            # Prefer native H.264/AAC at each resolution: anything ≤1080p is then
+            # already an mp4 and passes through --recode-video untouched (no
+            # quality loss), while 1440p/4K (VP9/AV1 only) gets re-encoded.
+            "--format-sort", "res,vcodec:h264,acodec:aac",
+            # Guarantee a Premiere-friendly H.264 mp4: re-encodes the VP9/AV1
+            # high-res streams; a no-op for streams already in mp4/H.264.
+            "--recode-video", "mp4",
             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         ]
+        if extractor_args:
+            cmd.extend(["--extractor-args", extractor_args])
 
         cookies_txt = BASE_PATH / "cookies.txt"
         if cookies_txt.exists():
