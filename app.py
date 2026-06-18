@@ -87,8 +87,8 @@ class AppleStyleApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Video Downloader")
-        self.root.geometry("820x900")
-        self.root.minsize(700, 760)
+        self.root.geometry("820x840")
+        self.root.minsize(700, 680)
 
         self.config = Config(BASE_PATH / "config.json")
         if not self.config.get("downloads_dir"):
@@ -222,21 +222,21 @@ class AppleStyleApp:
         # weighted row, so without a floor it absorbs all the layout shrink and
         # collapses to ~0px until the user resizes the window. Kept modest so the
         # many option rows below + the Start button still fit without scrolling.
-        parent.grid_rowconfigure(2, weight=1, minsize=110)
+        parent.grid_rowconfigure(2, weight=1, minsize=80)
 
         tk.Label(
             parent, text="Batch Video Downloader", bg=self.bg_color, fg=self.text_color,
             font=(self.font_family, 22, "bold"),
-        ).grid(row=0, column=0, sticky="w", pady=(20, 2), padx=10)
+        ).grid(row=0, column=0, sticky="w", pady=(8, 2), padx=10)
 
         tk.Label(
             parent, text="Paste Title on line 1, Link on line 2, etc.",
             bg=self.bg_color, fg="#86868B", font=(self.font_family, 10),
-        ).grid(row=1, column=0, sticky="w", pady=(0, 8), padx=10)
+        ).grid(row=1, column=0, sticky="w", pady=(0, 4), padx=10)
 
         # Text area with proper border via frame highlight
         border = tk.Frame(parent, bg="#D2D2D7")
-        border.grid(row=2, column=0, sticky="nsew", pady=(0, 12), padx=10)
+        border.grid(row=2, column=0, sticky="nsew", pady=(0, 8), padx=10)
         border.grid_columnconfigure(0, weight=1)
         border.grid_rowconfigure(0, weight=1)
 
@@ -475,7 +475,7 @@ class AppleStyleApp:
 
     def _build_save_row(self, parent: tk.Frame, row: int) -> None:
         frame = tk.Frame(parent, bg=self.bg_color)
-        frame.grid(row=row, column=0, sticky="ew", pady=(0, 10), padx=10)
+        frame.grid(row=row, column=0, sticky="ew", pady=(0, 6), padx=10)
         frame.grid_columnconfigure(1, weight=1)
 
         tk.Label(
@@ -503,7 +503,7 @@ class AppleStyleApp:
 
     def _build_trans_save_row(self, parent: tk.Frame, row: int) -> None:
         frame = tk.Frame(parent, bg=self.bg_color)
-        frame.grid(row=row, column=0, sticky="ew", pady=(0, 10), padx=10)
+        frame.grid(row=row, column=0, sticky="ew", pady=(0, 6), padx=10)
         frame.grid_columnconfigure(1, weight=1)
 
         tk.Label(
@@ -530,7 +530,7 @@ class AppleStyleApp:
 
     def _build_dl_quality_row(self, parent: tk.Frame, row: int) -> None:
         frame = tk.Frame(parent, bg=self.bg_color)
-        frame.grid(row=row, column=0, sticky="ew", pady=(0, 10), padx=10)
+        frame.grid(row=row, column=0, sticky="ew", pady=(0, 6), padx=10)
 
         tk.Label(
             frame, text="Max Quality:", bg=self.bg_color, fg=self.text_color,
@@ -558,7 +558,7 @@ class AppleStyleApp:
 
     def _build_dl_options_row(self, parent: tk.Frame, row: int) -> None:
         frame = tk.Frame(parent, bg=self.bg_color)
-        frame.grid(row=row, column=0, sticky="ew", pady=(0, 10), padx=10)
+        frame.grid(row=row, column=0, sticky="ew", pady=(0, 6), padx=10)
 
         tk.Label(
             frame, text="Subtitle Sync Mode:", bg=self.bg_color, fg=self.text_color,
@@ -589,7 +589,7 @@ class AppleStyleApp:
 
     def _build_dl_concurrent_row(self, parent: tk.Frame, row: int) -> None:
         frame = tk.Frame(parent, bg=self.bg_color)
-        frame.grid(row=row, column=0, sticky="ew", pady=(0, 10), padx=10)
+        frame.grid(row=row, column=0, sticky="ew", pady=(0, 6), padx=10)
 
         self.concurrent_var = tk.BooleanVar(value=self.config.get("concurrent_downloads", False))
         ModernCheckbutton(
@@ -609,7 +609,7 @@ class AppleStyleApp:
 
     def _build_dub_row(self, parent: tk.Frame, row: int) -> None:
         frame = tk.Frame(parent, bg=self.bg_color)
-        frame.grid(row=row, column=0, sticky="ew", pady=(0, 10), padx=10)
+        frame.grid(row=row, column=0, sticky="ew", pady=(0, 6), padx=10)
         frame.grid_columnconfigure(1, weight=1)
 
         tk.Label(
@@ -638,7 +638,7 @@ class AppleStyleApp:
 
     def _build_advanced_row(self, parent: tk.Frame, row: int) -> None:
         frame = tk.Frame(parent, bg=self.bg_color)
-        frame.grid(row=row, column=0, sticky="ew", pady=(0, 10), padx=10)
+        frame.grid(row=row, column=0, sticky="ew", pady=(0, 6), padx=10)
 
         # First row of advanced options
         row1 = tk.Frame(frame, bg=self.bg_color)
@@ -720,7 +720,7 @@ class AppleStyleApp:
 
     def _build_trans_concurrent_row(self, parent: tk.Frame, row: int) -> None:
         frame = tk.Frame(parent, bg=self.bg_color)
-        frame.grid(row=row, column=0, sticky="ew", pady=(0, 10), padx=10)
+        frame.grid(row=row, column=0, sticky="ew", pady=(0, 6), padx=10)
 
         self.trans_concurrent_var = tk.BooleanVar(value=self.config.get("trans_concurrent", False))
         ModernCheckbutton(
@@ -742,7 +742,7 @@ class AppleStyleApp:
 
     def _build_dl_button_row(self, parent: tk.Frame, row: int) -> None:
         frame = tk.Frame(parent, bg=self.bg_color)
-        frame.grid(row=row, column=0, sticky="ew", pady=(8, 16), padx=10)
+        frame.grid(row=row, column=0, sticky="ew", pady=(6, 8), padx=10)
         frame.grid_columnconfigure(0, weight=1)
         frame.grid_columnconfigure(1, weight=1)
 
@@ -785,7 +785,7 @@ class AppleStyleApp:
     def _build_log_area(self, parent: tk.Frame) -> None:
         # Dark terminal log box with rounded border simulation
         outer = tk.Frame(parent, bg="#3A3A3C", pady=2, padx=2)
-        outer.grid(row=10, column=0, sticky="ew", pady=(12, 0), padx=0)
+        outer.grid(row=10, column=0, sticky="ew", pady=(8, 0), padx=0)
         outer.grid_columnconfigure(0, weight=1)
         outer.grid_rowconfigure(0, weight=1)
 
@@ -795,7 +795,7 @@ class AppleStyleApp:
         log_inner.grid_rowconfigure(0, weight=1)
 
         self.log_text = tk.Text(
-            log_inner, wrap=tk.WORD, height=7, font=("Consolas", 10),
+            log_inner, wrap=tk.WORD, height=5, font=("Consolas", 10),
             bg="#1D1D1F", fg="#A8FF78", insertbackground="#1D1D1F",
             relief=tk.FLAT, padx=12, pady=10, state="disabled",
         )
