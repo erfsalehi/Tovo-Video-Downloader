@@ -87,8 +87,8 @@ class AppleStyleApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Video Downloader")
-        self.root.geometry("800x800")
-        self.root.minsize(700, 700)
+        self.root.geometry("820x900")
+        self.root.minsize(700, 760)
 
         self.config = Config(BASE_PATH / "config.json")
         if not self.config.get("downloads_dir"):
@@ -220,8 +220,9 @@ class AppleStyleApp:
         parent.grid_columnconfigure(0, weight=1)
         # minsize keeps the input visible on first paint: row 2 is the only
         # weighted row, so without a floor it absorbs all the layout shrink and
-        # collapses to ~0px until the user resizes the window.
-        parent.grid_rowconfigure(2, weight=1, minsize=160)
+        # collapses to ~0px until the user resizes the window. Kept modest so the
+        # many option rows below + the Start button still fit without scrolling.
+        parent.grid_rowconfigure(2, weight=1, minsize=110)
 
         tk.Label(
             parent, text="Batch Video Downloader", bg=self.bg_color, fg=self.text_color,
@@ -1530,7 +1531,7 @@ class AppleStyleApp:
                     self.log("\nBatch download complete.")
                 
                 # Always allow user to review before returning
-                self.root.after(0, lambda: self.download_btn.config_state("normal", text="Finish & Return", bg="#34C759"))
+                self.root.after(0, self._show_download_review_buttons)
             else:
                 self.log("\nBatch download cancelled by user.")
                 self.root.after(0, self.reset_ui)
@@ -2282,13 +2283,23 @@ class AppleStyleApp:
     # ------------------------------------------------------------------
     # UI reset
     # ------------------------------------------------------------------
+    def _show_download_review_buttons(self) -> None:
+        """Post-batch review state: 'Finish & Return' plus a one-click shortcut
+        to the download folder (the Cancel button is repurposed, since there is
+        nothing left to cancel)."""
+        self.download_btn.config_state("normal", text="Finish & Return", bg="#34C759")
+        self.cancel_btn.command = lambda: self._open_folder(self.downloads_dir)
+        self.cancel_btn.config_state("normal", text="📂  Open Folder", bg=self.accent_color)
+
     def reset_ui(self) -> None:
         with self._state_lock:
             self.downloading = False
-        
+
         # Reset Download Tab Buttons
         self.download_btn.config_state("normal", text="⬇  Start Batch Download", bg=self.accent_color)
-        self.cancel_btn.config_state("disabled", bg="#E5E5EA")
+        # Restore the Cancel button (it doubles as 'Open Folder' in review state).
+        self.cancel_btn.command = self.cancel_download
+        self.cancel_btn.config_state("disabled", text="Cancel", bg="#E5E5EA")
         self.browse_btn.config_state("normal", bg=self.gray_bg)
         self.dl_input_text.config(state="normal", bg="white")
         if hasattr(self, "dl_input_frame"):
