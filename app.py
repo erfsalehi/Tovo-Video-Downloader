@@ -1329,10 +1329,14 @@ class AppleStyleApp:
             "--no-playlist",
             "-f", self._build_format_selector(),
             "--merge-output-format", "mp4",
-            # Prefer native H.264/AAC at each resolution: anything ≤1080p is then
-            # already an mp4 and passes through --recode-video untouched (no
-            # quality loss), while 1440p/4K (VP9/AV1 only) gets re-encoded.
-            "--format-sort", "res,vcodec:h264,acodec:aac",
+            # Prefer (in order): highest resolution, then https/DASH over HLS,
+            # then native H.264/AAC. The proto preference is critical for
+            # Premiere: HLS (m3u8) formats download muxed with the audio track
+            # *before* the video track, which Premiere Pro refuses to import.
+            # DASH formats arrive as separate streams that merge video-first.
+            # Keeping H.264/AAC preferred means ≤1080p stays an untouched mp4
+            # (no re-encode); 1440p/4K (VP9/AV1 only) gets re-encoded.
+            "--format-sort", "res,proto,vcodec:h264,acodec:aac",
             # Guarantee a Premiere-friendly H.264 mp4: re-encodes the VP9/AV1
             # high-res streams; a no-op for streams already in mp4/H.264.
             "--recode-video", "mp4",
