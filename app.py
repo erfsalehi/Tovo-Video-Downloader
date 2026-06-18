@@ -87,8 +87,15 @@ class AppleStyleApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Video Downloader")
-        self.root.geometry("820x840")
-        self.root.minsize(700, 680)
+        # Open at (nearly) full work-area height for a roomier layout — the paste
+        # box absorbs the extra space. Width stays compact and centred. Using the
+        # work area (not raw screen height) keeps the window clear of the taskbar.
+        wx, wy, ww, wh = self._usable_screen_rect()
+        win_w = min(860, ww)
+        win_h = max(680, wh - 48)  # leave room for the title bar
+        pos_x = wx + max(0, (ww - win_w) // 2)
+        self.root.geometry(f"{win_w}x{win_h}+{pos_x}+{wy}")
+        self.root.minsize(700, 640)
 
         self.config = Config(BASE_PATH / "config.json")
         if not self.config.get("downloads_dir"):
@@ -127,6 +134,21 @@ class AppleStyleApp:
         self._sync_chosen: List[dict] = []
 
         self.root.after(500, self.check_dependencies)
+
+    def _usable_screen_rect(self) -> Tuple[int, int, int, int]:
+        """(x, y, width, height) of the desktop work area — i.e. the screen minus
+        the taskbar. Falls back to the full screen size off Windows or on error."""
+        if os.name == "nt":
+            try:
+                import ctypes
+                from ctypes import wintypes
+                rect = wintypes.RECT()
+                # SPI_GETWORKAREA = 0x0030
+                if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
+                    return rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top
+            except Exception:
+                logger.debug("Could not query screen work area", exc_info=True)
+        return 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
 
     # ------------------------------------------------------------------
     # UI construction
