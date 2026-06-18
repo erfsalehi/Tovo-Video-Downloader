@@ -1350,6 +1350,18 @@ class AppleStyleApp:
             # Guarantee a Premiere-friendly H.264 mp4: re-encodes the VP9 high-res
             # streams (which arrive as mkv); a no-op for H.264 already in mp4.
             "--recode-video", "mp4",
+            # Pin the re-encode to a profile Premiere can actually import. The big
+            # one is -pix_fmt yuv420p: YouTube's high-res/HDR VP9 is often 10-bit,
+            # and a default re-encode would emit 10-bit H.264 (High 10) which
+            # Premiere rejects with a generic "importer" error. Also force 8-bit
+            # High profile, constant frame rate (VFR also trips the importer),
+            # 48 kHz AAC, and +faststart (moov atom at the front).
+            "--postprocessor-args",
+            "VideoConvertor:-c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p "
+            "-profile:v high -fps_mode cfr -c:a aac -b:a 192k -ar 48000 -movflags +faststart",
+            # Native (already-H.264) merges skip the re-encode above; still give
+            # them a front-loaded moov atom for clean importing.
+            "--postprocessor-args", "Merger:-movflags +faststart",
             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         ]
         if extractor_args:
