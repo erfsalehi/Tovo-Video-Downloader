@@ -1301,10 +1301,16 @@ class AppleStyleApp:
         stream ≤ H, falling back to the uncapped best only if nothing qualifies.
         """
         height = self.QUALITY_HEIGHTS.get(self.max_quality_var.get())
+        # Exclude AV1. Like VP9 it has no H.264 equivalent at 1440p/4K, but unlike
+        # VP9 YouTube ships it already inside an mp4 container — which slips past
+        # --recode-video (that only re-encodes when the container isn't already
+        # mp4), leaving an "av01" file Premiere can't read. Forcing VP9 makes the
+        # merge land in mkv, which reliably triggers the H.264 re-encode.
+        no_av1 = "[vcodec!*=av01]"
         if not height:
-            return "bv*+ba/b"
+            return f"bv*{no_av1}+ba/b"
         h = f"[height<={height}]"
-        return f"bv*{h}+ba/b{h}/b"
+        return f"bv*{h}{no_av1}+ba/b{h}/b"
 
     def _build_yt_dlp_command(self, title: str, link: str) -> List[str]:
         safe_title = sanitize_filename(title)
@@ -1328,17 +1334,21 @@ class AppleStyleApp:
             "-o", output_path,
             "--no-playlist",
             "-f", self._build_format_selector(),
-            "--merge-output-format", "mp4",
+            # NB: deliberately no --merge-output-format mp4. Forcing mp4 would
+            # mux VP9 *into* mp4, and --recode-video then skips it (container is
+            # already mp4) — leaving a "vp09" file Premiere can't read. Letting
+            # the merge default means H.264 lands in mp4 (recode no-op) while VP9
+            # lands in mkv, which reliably triggers the H.264 re-encode below.
             # Prefer (in order): highest resolution, then https/DASH over HLS,
             # then native H.264/AAC. The proto preference is critical for
             # Premiere: HLS (m3u8) formats download muxed with the audio track
             # *before* the video track, which Premiere Pro refuses to import.
             # DASH formats arrive as separate streams that merge video-first.
             # Keeping H.264/AAC preferred means ≤1080p stays an untouched mp4
-            # (no re-encode); 1440p/4K (VP9/AV1 only) gets re-encoded.
+            # (no re-encode); 1440p/4K (VP9 only) gets re-encoded.
             "--format-sort", "res,proto,vcodec:h264,acodec:aac",
-            # Guarantee a Premiere-friendly H.264 mp4: re-encodes the VP9/AV1
-            # high-res streams; a no-op for streams already in mp4/H.264.
+            # Guarantee a Premiere-friendly H.264 mp4: re-encodes the VP9 high-res
+            # streams (which arrive as mkv); a no-op for H.264 already in mp4.
             "--recode-video", "mp4",
             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         ]
