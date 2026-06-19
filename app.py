@@ -70,14 +70,13 @@ def parse_titles_and_links(text: str):
 class AppleStyleApp:
     """Main GUI window: input pane, options, log, and the download worker."""
 
-    # Max-quality cap → max video height in pixels. "Best Available" (None)
-    # means no cap. Any other value downloads the best stream up to that height
-    # (e.g. a 4K source capped at 1080p downloads 1080p; a 720p-only source
-    # capped at 1080p still downloads 720p).
+    # Max-quality cap → max video height in pixels. "Default" (None) means no
+    # cap: the best H.264 stream, which on YouTube tops out at 1080p. Any other
+    # value caps the height (best available H.264 up to that height). Only H.264
+    # resolutions are offered because the downloader is H.264-only for Premiere
+    # compatibility — YouTube has no H.264 above 1080p.
     QUALITY_HEIGHTS: Dict[str, Optional[int]] = {
-        "Best Available": None,
-        "2160p (4K)": 2160,
-        "1440p (2K)": 1440,
+        "Default": None,
         "1080p (Full HD)": 1080,
         "720p (HD)": 720,
         "480p": 480,
@@ -560,11 +559,11 @@ class AppleStyleApp:
         ).pack(side=tk.LEFT, padx=(0, 8))
 
         self.max_quality_var = tk.StringVar(
-            value=self.config.get("max_quality", "Best Available")
+            value=self.config.get("max_quality", "Default")
         )
-        # Fall back to "Best Available" if a stale/unknown value was persisted.
+        # Fall back to "Default" if a stale/unknown value was persisted.
         if self.max_quality_var.get() not in self.QUALITY_HEIGHTS:
-            self.max_quality_var.set("Best Available")
+            self.max_quality_var.set("Default")
         ttk.Combobox(
             frame, textvariable=self.max_quality_var,
             values=list(self.QUALITY_HEIGHTS.keys()),
@@ -572,7 +571,7 @@ class AppleStyleApp:
         ).pack(side=tk.LEFT, padx=(0, 12))
 
         tk.Label(
-            frame, text="Downloads the best available quality up to this limit.",
+            frame, text="Default = best H.264 (up to 1080p). Lower caps the height.",
             bg=self.bg_color, fg="#86868B", font=(self.font_family, 9),
         ).pack(side=tk.LEFT)
 
@@ -1289,28 +1288,26 @@ class AppleStyleApp:
             self.active_processes.pop(index, None)
 
     def _build_format_selector(self) -> str:
-        """yt-dlp ``-f`` selector, optionally capped to a max video height.
+        """yt-dlp ``-f`` selector. Always H.264 (avc1) video + AAC audio in mp4 —
+        the one combination YouTube serves that Adobe Premiere imports natively,
+        with no re-encoding. Everything else YouTube offers breaks Premiere's
+        importer: VP9 (``vp09``) and AV1 (``av01``) — even when muxed into an mp4
+        — and 10-bit streams. H.264 is also DASH (separate video+audio, https), so
+        the merged file is video-first and 8-bit.
 
-        Deliberately permissive on codec/container so high resolutions stay
-        reachable: YouTube only ships 1440p/4K as VP9/AV1, never H.264, so the
-        old ``[ext=mp4]`` lock silently capped every download at 1080p. The
-        ``--format-sort`` and ``--recode-video`` args added in
-        ``_build_yt_dlp_command`` handle editor compatibility — they keep
-        anything ≤1080p as an untouched native H.264 mp4 and re-encode only the
-        higher VP9/AV1 streams to H.264. With a cap of H this takes the best
-        stream ≤ H, falling back to the uncapped best only if nothing qualifies.
+        "Default" (no cap) takes the best H.264, which tops out at 1080p because
+        YouTube has no H.264 above that. A height cap restricts it further. The
+        trailing fallbacks only fire for the rare video with no H.264 at all.
         """
+        avc1 = "[ext=mp4][vcodec^=avc1]"
         height = self.QUALITY_HEIGHTS.get(self.max_quality_var.get())
-        # Exclude AV1. Like VP9 it has no H.264 equivalent at 1440p/4K, but unlike
-        # VP9 YouTube ships it already inside an mp4 container — which slips past
-        # --recode-video (that only re-encodes when the container isn't already
-        # mp4), leaving an "av01" file Premiere can't read. Forcing VP9 makes the
-        # merge land in mkv, which reliably triggers the H.264 re-encode.
-        no_av1 = "[vcodec!*=av01]"
         if not height:
-            return f"bv*{no_av1}+ba/b"
+            return f"bv{avc1}+ba[ext=m4a]/b{avc1}/b[ext=mp4]/b"
         h = f"[height<={height}]"
-        return f"bv*{h}{no_av1}+ba/b{h}/b"
+        return (
+            f"bv{avc1}{h}+ba[ext=m4a]/b{avc1}{h}"
+            f"/b[ext=mp4]{h}/b[ext=mp4]/b"
+        )
 
     def _build_yt_dlp_command(self, title: str, link: str) -> List[str]:
         safe_title = sanitize_filename(title)
@@ -1319,11 +1316,10 @@ class AppleStyleApp:
         yt_dlp_exe = BASE_PATH / "yt-dlp.exe"
         exe_path = str(yt_dlp_exe) if yt_dlp_exe.exists() else "yt-dlp"
 
-        # Player clients. yt-dlp's default set exposes the full DASH ladder
-        # (incl. 1440p/4K) and avoids both the android/mweb SABR 360p cap and
-        # web_safari's HLS 1080p ceiling. The TV client (bot-detection bypass)
-        # is *added* to the default set, not substituted, so quality reach is
-        # preserved when the toggle is on.
+        # Player clients. yt-dlp's default set returns DASH H.264 at full
+        # resolution (the android/mweb clients are now SABR-capped to 360p). The
+        # TV client (bot-detection bypass) is *added* to the default set, not
+        # substituted, when the toggle is on.
         extractor_args = (
             "youtube:player_client=default,tv"
             if self.use_tv_client_var.get() else None
@@ -1333,35 +1329,12 @@ class AppleStyleApp:
             exe_path,
             "-o", output_path,
             "--no-playlist",
+            # H.264/AAC mp4 only (see _build_format_selector) — imports into
+            # Premiere natively, so there is no re-encode step and nothing to go
+            # wrong with VP9/AV1/10-bit. H.264 is DASH, so streams merge into a
+            # clean video-first mp4.
             "-f", self._build_format_selector(),
-            # NB: deliberately no --merge-output-format mp4. Forcing mp4 would
-            # mux VP9 *into* mp4, and --recode-video then skips it (container is
-            # already mp4) — leaving a "vp09" file Premiere can't read. Letting
-            # the merge default means H.264 lands in mp4 (recode no-op) while VP9
-            # lands in mkv, which reliably triggers the H.264 re-encode below.
-            # Prefer (in order): highest resolution, then https/DASH over HLS,
-            # then native H.264/AAC. The proto preference is critical for
-            # Premiere: HLS (m3u8) formats download muxed with the audio track
-            # *before* the video track, which Premiere Pro refuses to import.
-            # DASH formats arrive as separate streams that merge video-first.
-            # Keeping H.264/AAC preferred means ≤1080p stays an untouched mp4
-            # (no re-encode); 1440p/4K (VP9 only) gets re-encoded.
-            "--format-sort", "res,proto,vcodec:h264,acodec:aac",
-            # Guarantee a Premiere-friendly H.264 mp4: re-encodes the VP9 high-res
-            # streams (which arrive as mkv); a no-op for H.264 already in mp4.
-            "--recode-video", "mp4",
-            # Pin the re-encode to a profile Premiere can actually import. The big
-            # one is -pix_fmt yuv420p: YouTube's high-res/HDR VP9 is often 10-bit,
-            # and a default re-encode would emit 10-bit H.264 (High 10) which
-            # Premiere rejects with a generic "importer" error. Also force 8-bit
-            # High profile, constant frame rate (VFR also trips the importer),
-            # 48 kHz AAC, and +faststart (moov atom at the front).
-            "--postprocessor-args",
-            "VideoConvertor:-c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p "
-            "-profile:v high -fps_mode cfr -c:a aac -b:a 192k -ar 48000 -movflags +faststart",
-            # Native (already-H.264) merges skip the re-encode above; still give
-            # them a front-loaded moov atom for clean importing.
-            "--postprocessor-args", "Merger:-movflags +faststart",
+            "--merge-output-format", "mp4",
             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         ]
         if extractor_args:
