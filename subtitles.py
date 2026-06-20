@@ -326,8 +326,12 @@ class WhisperAligner:
         audio_source: str,
         is_cancelled: CancelFn = lambda: False,
         progress_callback: Optional[ProgressFn] = None,
+        language: Optional[str] = None,
     ) -> Optional[str]:
-        """Transcribe ``audio_source`` and return the full text transcript."""
+        """Transcribe ``audio_source`` and return the full text transcript.
+
+        Pass ``language`` (e.g. ``"en"``) to force a language instead of letting
+        Whisper auto-detect it."""
         if is_cancelled():
             return None
         model = self._ensure_model()
@@ -335,12 +339,12 @@ class WhisperAligner:
         if is_cancelled():
             return None
         self.log("-> Transcribing audio with Whisper AI (Full Transcript)...")
-        
+
         # stable-whisper supports progress_callback
-        result = model.transcribe(
-            audio_source,
-            progress_callback=progress_callback
-        )
+        kwargs = {"progress_callback": progress_callback}
+        if language:
+            kwargs["language"] = language
+        result = model.transcribe(audio_source, **kwargs)
 
         if is_cancelled():
             return None
@@ -358,12 +362,21 @@ class WhisperAligner:
         is_cancelled: CancelFn = lambda: False,
         unaligned_interval: float = UNALIGNED_INTERVAL,
         progress_callback: Optional[ProgressFn] = None,
+        fill_gaps: bool = True,
+        min_duration: float = 0.3,
     ) -> bool:
         """Align ``subs`` to ``audio_source`` and write an SRT file.
 
-        Lines whose words extend past the audio (e.g. dub ends before the
-        original) are fanned out into sequential ``unaligned_interval``-second
-        intervals so they remain visible.
+        Each input line is aligned to the audio as its own cue (via stable-whisper
+        ``original_split``), giving accurate per-line start/end times. Lines whose
+        speech extends past the audio (e.g. the dub ends before the original) are
+        fanned out into sequential ``unaligned_interval``-second cues so they stay
+        visible.
+
+        When ``fill_gaps`` is True, each cue is extended to end exactly where the
+        next one starts, so a line stays on screen through any pause/silence until
+        the following line begins (the trailing silence belongs to the previous
+        line). The final cue runs to the end of the audio.
         """
         if is_cancelled():
             return False
@@ -382,60 +395,140 @@ class WhisperAligner:
         self.log(f"-> Detected language: '{detected_lang}'")
 
         valid_subs = [line for line in subs if line.strip()]
+        if not valid_subs:
+            self.log("-> No subtitle text to sync.")
+            return False
         text_to_align = "\n".join(valid_subs)
 
         if is_cancelled():
             return False
         self.log(f"-> Syncing {len(valid_subs)} lines...")
-        result = model.align(
-            audio_source, text_to_align, detected_lang,
-            progress_callback=progress_callback
+
+        raw_times = self._aligned_line_times(
+            model, audio_source, valid_subs, text_to_align, detected_lang,
+            audio_duration, progress_callback,
+        )
+        if raw_times is None:
+            return False
+
+        cues = self._finalize_cues(
+            raw_times, audio_duration, unaligned_interval, min_duration, fill_gaps,
         )
 
-        all_words: List = []
-        for s in result.segments:
-            all_words.extend(getattr(s, "words", []))
-
-        line_word_mapping = self._map_words_to_lines(valid_subs, all_words)
-
         with srt_path.open("w", encoding="utf-8") as f:
-            current_unaligned: Optional[float] = None
-
-            for i, (line_text, words_in_line) in enumerate(zip(valid_subs, line_word_mapping), 1):
-                if not words_in_line:
-                    continue
-
-                is_unaligned = all(
-                    (w.start == w.end or w.start >= audio_duration - 0.5)
-                    for w in words_in_line
-                )
-                if current_unaligned is not None:
-                    is_unaligned = True
-
-                if is_unaligned:
-                    if current_unaligned is None:
-                        last_end = 0.0
-                        for prev_words in line_word_mapping[: i - 1]:
-                            for pw in prev_words:
-                                if pw.start != pw.end and pw.end < audio_duration - 0.5:
-                                    last_end = max(last_end, pw.end)
-                        current_unaligned = last_end if last_end > 0 else audio_duration
-
-                    start_time = current_unaligned
-                    end_time = start_time + unaligned_interval
-                    current_unaligned = end_time
-                else:
-                    start_time = words_in_line[0].start
-                    end_time = words_in_line[-1].end
-                    if start_time >= end_time:
-                        end_time = start_time + unaligned_interval
-
+            for i, ((start_time, end_time), line_text) in enumerate(
+                zip(cues, valid_subs), 1
+            ):
                 f.write(
                     f"{i}\n{format_time(start_time)} --> {format_time(end_time)}\n{line_text}\n\n"
                 )
 
         self.log("-> Whisper sync successful! SRT saved.")
         return True
+
+    def _aligned_line_times(
+        self, model, audio_source: str, valid_subs: Sequence[str],
+        text_to_align: str, detected_lang: str, audio_duration: float,
+        progress_callback: Optional[ProgressFn],
+    ) -> Optional[List[Tuple[Optional[float], Optional[float]]]]:
+        """Return a (start, end) per line; ``(None, None)`` marks an unaligned line.
+
+        Prefers ``original_split`` (one segment per input line); if that yields a
+        different segment count, falls back to the legacy char-count word mapping.
+        """
+        align_kwargs = {"original_split": True}
+        if progress_callback is not None:
+            align_kwargs["progress_callback"] = progress_callback
+        try:
+            result = model.align(audio_source, text_to_align, detected_lang, **align_kwargs)
+        except TypeError:
+            # Older stable-whisper without original_split/progress_callback kwargs.
+            result = model.align(audio_source, text_to_align, detected_lang)
+        except Exception:
+            logger.exception("stable-whisper align failed")
+            self.log("[!] Whisper alignment failed.")
+            return None
+        if result is None:
+            return None
+
+        segments = list(result.segments)
+        if len(segments) == len(valid_subs):
+            return [self._segment_times(s, audio_duration) for s in segments]
+
+        # Fallback: flatten words and re-map to lines by character count.
+        self.log(
+            f"-> Note: alignment produced {len(segments)} segments for "
+            f"{len(valid_subs)} lines; using word-level mapping."
+        )
+        all_words: List = []
+        for s in segments:
+            all_words.extend(getattr(s, "words", []) or [])
+        times: List[Tuple[Optional[float], Optional[float]]] = []
+        for words in self._map_words_to_lines(valid_subs, all_words):
+            aligned = [
+                w for w in words
+                if w.start != w.end and w.end < audio_duration - 0.05
+            ]
+            if aligned:
+                times.append((min(w.start for w in aligned), max(w.end for w in aligned)))
+            else:
+                times.append((None, None))
+        return times
+
+    @staticmethod
+    def _segment_times(seg, audio_duration: float) -> Tuple[Optional[float], Optional[float]]:
+        s = getattr(seg, "start", None)
+        e = getattr(seg, "end", None)
+        # Treat empty or end-clamped segments (speech ran past the audio) as
+        # unaligned so they get fanned out instead of piling up at the very end.
+        if s is None or e is None or e <= s or s >= audio_duration - 0.05:
+            return (None, None)
+        return (float(s), float(e))
+
+    @staticmethod
+    def _finalize_cues(
+        raw_times: Sequence[Tuple[Optional[float], Optional[float]]],
+        audio_duration: float,
+        unaligned_interval: float,
+        min_duration: float,
+        fill_gaps: bool,
+    ) -> List[Tuple[float, float]]:
+        """Turn raw per-line times into clean, ordered, non-overlapping cues."""
+        n = len(raw_times)
+        starts: List[float] = [0.0] * n
+        ends: List[float] = [0.0] * n
+
+        # Pass 1: fill in unaligned lines sequentially; clamp to valid ranges.
+        last_end = 0.0
+        for i, (s, e) in enumerate(raw_times):
+            if s is None or e is None:
+                s = last_end
+                e = s + unaligned_interval
+            s = max(0.0, s)
+            e = max(e, s + min_duration)
+            starts[i], ends[i] = s, e
+            last_end = e
+
+        # Pass 2: enforce non-decreasing starts with a minimum spacing so cues
+        # never overlap and each remains readable.
+        for i in range(1, n):
+            if starts[i] < starts[i - 1] + min_duration:
+                starts[i] = starts[i - 1] + min_duration
+            if ends[i] < starts[i] + min_duration:
+                ends[i] = starts[i] + min_duration
+
+        # Pass 3: gap handling.
+        if fill_gaps:
+            for i in range(n - 1):
+                ends[i] = starts[i + 1]          # stay on screen until the next line
+            if audio_duration and ends[n - 1] < audio_duration:
+                ends[n - 1] = audio_duration     # last line runs to the end
+        else:
+            for i in range(n - 1):
+                if ends[i] > starts[i + 1]:
+                    ends[i] = starts[i + 1]       # just trim any overlap
+
+        return list(zip(starts, ends))
 
     @staticmethod
     def _map_words_to_lines(valid_subs: Sequence[str], all_words: List) -> List[List]:
@@ -458,10 +551,14 @@ class WhisperAligner:
 class GroqTranscriber:
     """Uses Groq's cloud Whisper API for fast transcription."""
 
-    def __init__(self, log: LogFn, api_key: str, proxy: str = "") -> None:
+    def __init__(self, log: LogFn, api_key: str, proxy: str = "",
+                 trust_env: bool = True) -> None:
         self.log = log
         self.api_key = api_key
         self.proxy = proxy
+        # When False, ignore system/environment proxies (HTTP(S)_PROXY). A dead
+        # local VPN proxy otherwise breaks the TLS handshake with SSL EOF errors.
+        self.trust_env = trust_env
         self.url = "https://api.groq.com/openai/v1/audio/transcriptions"
 
     def transcribe_to_text(
@@ -469,6 +566,7 @@ class GroqTranscriber:
         audio_path: str,
         is_cancelled: CancelFn = lambda: False,
         progress_callback: Optional[ProgressFn] = None,
+        language: Optional[str] = None,
     ) -> Optional[str]:
         if not self.api_key:
             self.log("[!] Error: Groq API Key is missing in settings.")
@@ -501,9 +599,13 @@ class GroqTranscriber:
                     "model": "whisper-large-v3",
                     "response_format": "text"
                 }
+                if language:
+                    data["language"] = language
                 headers = {"Authorization": f"Bearer {self.api_key}"}
                 proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
-                response = requests.post(
+                session = requests.Session()
+                session.trust_env = self.trust_env  # honour "Disable System Proxy"
+                response = session.post(
                     self.url, headers=headers, files=files, data=data,
                     timeout=60, proxies=proxies,
                 )

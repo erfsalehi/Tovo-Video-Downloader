@@ -23,6 +23,27 @@ DEFAULTS: dict[str, Any] = {
     "proxy_url": "",
     "last_yt_dlp_update_check": "",
     "export_ttml": False,
+    "sync_fill_gaps": True,
+    "sync_model": "small",
+    # --- Voiceover (dubbing) tab ---
+    "vo_source_dir": "",
+    "vo_sources": [],
+    "vo_process": "Both",
+    "vo_silence_threshold": 0.1,
+    "vo_silence_target": 0.07,
+    "vo_silence_noise_db": -30,
+    "vo_silence_pad_ms": 40,
+    "vo_title_seconds": 5,
+    "rvc_dir": r"C:\Users\erfsa\Desktop\Mangio-RVC-v23.7.0",
+    "rvc_device": "Auto",
+    "rvc_uptin": {
+        "pitch": -2, "index_rate": 0, "f0method": "rmvpe", "protect": 0.33,
+        "filter_radius": 3, "rms_mix_rate": 1, "resample_sr": 0,
+    },
+    "rvc_pat": {
+        "pitch": -2, "index_rate": 0, "f0method": "rmvpe", "protect": 0.33,
+        "filter_radius": 3, "rms_mix_rate": 1, "resample_sr": 0,
+    },
     "caption_style": {
         "font_family": "Arial",
         "font_size": 36,

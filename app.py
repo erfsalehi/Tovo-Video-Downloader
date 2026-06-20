@@ -7,7 +7,9 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
+import time
 import tkinter as tk
 from collections import deque
 from pathlib import Path
@@ -24,6 +26,7 @@ from subtitles import (
     CaptionStyle, write_ttml,
 )
 from widgets import DownloadManager, RoundedButton, RoundedEntry, ModernCheckbutton, RoundedFrame
+import voiceover
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +105,12 @@ class AppleStyleApp:
         self.downloads_dir = Path(self.config.get("downloads_dir"))
         self.trans_dir = Path(self.config.get("trans_dir", str(BASE_PATH / "Transcriptions")))
         self.dub_dir = self.config.get("dub_dir", "")
+        self.vo_source_dir = self.config.get("vo_source_dir", "")
+        # Source inputs may be a mix of folders and .zip archives. Migrate the
+        # old single-folder setting into the list on first run.
+        self.vo_sources: List[str] = list(self.config.get("vo_sources", []) or [])
+        if not self.vo_sources and self.vo_source_dir:
+            self.vo_sources = [self.vo_source_dir]
         self.downloads_dir.mkdir(parents=True, exist_ok=True)
         self.trans_dir.mkdir(parents=True, exist_ok=True)
 
@@ -131,6 +140,10 @@ class AppleStyleApp:
         self.sync_manager: Optional[DownloadManager] = None
         self.sync_items: List[dict] = []   # scan results: {title, srt_path, audio_path, kind}
         self._sync_chosen: List[dict] = []
+
+        # Voiceover tab state
+        self.vo_manager: Optional[DownloadManager] = None
+        self._vo_candidates: List[Dict] = []  # clip specs (folder files + zip members)
 
         self.root.after(500, self.check_dependencies)
 
@@ -188,7 +201,15 @@ class AppleStyleApp:
             text_color="#86868B", font=(self.font_family, 11, "bold"),
             width=150, height=45
         )
-        self.btn_sync_tab.pack(side=tk.LEFT)
+        self.btn_sync_tab.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.btn_vo_tab = RoundedButton(
+            tab_frame, text="Voiceover", command=lambda: self._switch_tab("vo"),
+            radius=20, bg_color=self.bg_color, hover_color=self.gray_hover,
+            text_color="#86868B", font=(self.font_family, 11, "bold"),
+            width=150, height=45
+        )
+        self.btn_vo_tab.pack(side=tk.LEFT)
 
         # Tab Content Area
         self.content_frame = tk.Frame(container, bg=self.bg_color)
@@ -211,6 +232,11 @@ class AppleStyleApp:
         self.sync_tab.grid(row=0, column=0, sticky="nsew")
         self._build_sync_tab(self.sync_tab)
 
+        # Tab 4: Voiceover
+        self.vo_tab = tk.Frame(self.content_frame, bg=self.bg_color)
+        self.vo_tab.grid(row=0, column=0, sticky="nsew")
+        self._build_vo_tab(self.vo_tab)
+
         # Initial State
         self._switch_tab("dl")
 
@@ -222,6 +248,7 @@ class AppleStyleApp:
             "dl": (self.dl_tab, self.btn_dl_tab),
             "trans": (self.trans_tab, self.btn_trans_tab),
             "sync": (self.sync_tab, self.btn_sync_tab),
+            "vo": (self.vo_tab, self.btn_vo_tab),
         }
         if tab not in tabs:
             return
@@ -402,6 +429,26 @@ class AppleStyleApp:
         lb_scroll = tk.Scrollbar(border, command=self.sync_listbox.yview)
         lb_scroll.grid(row=0, column=1, sticky="ns")
         self.sync_listbox.config(yscrollcommand=lb_scroll.set)
+
+        opts = tk.Frame(self.sync_select_frame, bg=self.bg_color)
+        opts.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.sync_fill_gaps_var = tk.BooleanVar(value=self.config.get("sync_fill_gaps", True))
+        ModernCheckbutton(
+            opts, text="Keep each line on screen until the next (fill silence)",
+            variable=self.sync_fill_gaps_var, bg_color=self.bg_color,
+            command=self._save_config,
+        ).pack(side=tk.LEFT)
+
+        tk.Label(opts, text="Accuracy:", bg=self.bg_color, fg=self.text_color,
+                 font=(self.font_family, 10, "bold")).pack(side=tk.LEFT, padx=(18, 6))
+        self.sync_model_var = tk.StringVar(value=self.config.get("sync_model", "small"))
+        ttk.Combobox(
+            opts, textvariable=self.sync_model_var, state="readonly", width=10,
+            values=["base", "small", "medium", "large-v3"], font=(self.font_family, 10),
+        ).pack(side=tk.LEFT)
+        tk.Label(opts, text="(bigger = more accurate, slower on CPU)", bg=self.bg_color,
+                 fg="#86868B", font=(self.font_family, 9)).pack(side=tk.LEFT, padx=(6, 0))
+        self.sync_model_var.trace_add("write", lambda *_: self._save_config())
 
         self._build_sync_button_row(parent, row=3)
 
@@ -657,6 +704,550 @@ class AppleStyleApp:
         self.dub_browse_btn.grid(row=0, column=2, sticky="e", padx=(6, 0))
 
 
+    # ------------------------------------------------------------------
+    # Voiceover tab
+    # ------------------------------------------------------------------
+    def _build_vo_tab(self, parent: tk.Frame) -> None:
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(2, weight=1)  # settings card / manager area
+
+        tk.Label(
+            parent, text="Voiceover Dubbing", bg=self.bg_color, fg=self.text_color,
+            font=(self.font_family, 22, "bold"),
+        ).grid(row=0, column=0, sticky="w", pady=(20, 2), padx=10)
+
+        tk.Label(
+            parent,
+            text="Renames each clip to its spoken title, shortens silences, then "
+                 "converts the voice with RVC into the Dub folder.",
+            bg=self.bg_color, fg="#86868B", font=(self.font_family, 10),
+            justify="left", wraplength=760,
+        ).grid(row=1, column=0, sticky="w", pady=(0, 10), padx=10)
+
+        # All controls live in a card we hide while a batch runs (the progress
+        # manager takes its place, like the other tabs do with their input box).
+        self.vo_settings_frame = tk.Frame(parent, bg=self.bg_color)
+        self.vo_settings_frame.grid(row=2, column=0, sticky="nsew")
+        self.vo_settings_frame.grid_columnconfigure(0, weight=1)
+
+        self.vo_voice_vars: Dict[str, Dict[str, tk.Variable]] = {}
+
+        self._build_vo_folder_rows(self.vo_settings_frame)
+        self._build_vo_options_row(self.vo_settings_frame)
+        self._build_vo_silence_row(self.vo_settings_frame)
+        self._build_vo_voices_row(self.vo_settings_frame)
+
+        self._build_vo_button_row(parent, row=3)
+
+    def _build_vo_folder_rows(self, parent: tk.Frame) -> None:
+        # Sources: any mix of folders and .zip archives. All matching clips are
+        # gathered across every entry and dubbed into the one Dub folder.
+        src = tk.Frame(parent, bg=self.bg_color)
+        src.pack(fill="x", padx=10, pady=(0, 6))
+        src.grid_columnconfigure(0, weight=1)
+        tk.Label(src, text="Source Folders / Zips:", bg=self.bg_color, fg=self.text_color,
+                 font=(self.font_family, 10, "bold")).grid(row=0, column=0, sticky="w", columnspan=2)
+
+        lb_border = tk.Frame(src, bg="#D2D2D7")
+        lb_border.grid(row=1, column=0, sticky="ew", pady=(2, 0))
+        lb_border.grid_columnconfigure(0, weight=1)
+        self.vo_sources_list = tk.Listbox(
+            lb_border, height=3, font=(self.font_family, 9), bg="white",
+            fg=self.text_color, relief=tk.FLAT, highlightthickness=0,
+            activestyle="none", selectmode=tk.EXTENDED,
+        )
+        self.vo_sources_list.grid(row=0, column=0, sticky="ew", padx=1, pady=1)
+        lb_scroll = tk.Scrollbar(lb_border, command=self.vo_sources_list.yview)
+        lb_scroll.grid(row=0, column=1, sticky="ns")
+        self.vo_sources_list.config(yscrollcommand=lb_scroll.set)
+
+        btns = tk.Frame(src, bg=self.bg_color)
+        btns.grid(row=1, column=1, sticky="n", padx=(6, 0))
+        for text, cmd in (
+            ("Add Folder", self.vo_add_folder),
+            ("Add Zip(s)", self.vo_add_zips),
+            ("Remove", self.vo_remove_sources),
+            ("Clear", self.vo_clear_sources),
+        ):
+            RoundedButton(
+                btns, text=text, command=cmd, radius=12,
+                bg_color=self.gray_bg, hover_color=self.gray_hover, text_color=self.text_color,
+                font=(self.font_family, 9, "bold"), width=104, height=28,
+            ).pack(fill="x", pady=(0, 4))
+        self._refresh_vo_sources()
+
+        # Dub (output) folder - shares config with the Downloads tab.
+        dub = tk.Frame(parent, bg=self.bg_color)
+        dub.pack(fill="x", padx=10, pady=(0, 6))
+        dub.grid_columnconfigure(1, weight=1)
+        tk.Label(dub, text="Dub Folder:", bg=self.bg_color, fg=self.text_color,
+                 font=(self.font_family, 10, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.vo_dub_label = tk.Label(
+            dub, text=self.dub_dir or "Not Selected", bg=self.bg_color,
+            fg="#5E5CE6", font=(self.font_family, 10), anchor="w",
+        )
+        self.vo_dub_label.grid(row=0, column=1, sticky="ew")
+        RoundedButton(
+            dub, text="Browse…", command=self.browse_vo_dub, radius=14,
+            bg_color=self.gray_bg, hover_color=self.gray_hover, text_color=self.text_color,
+            font=(self.font_family, 10, "bold"), width=90, height=32,
+        ).grid(row=0, column=2, sticky="e", padx=(6, 0))
+
+    def _build_vo_options_row(self, parent: tk.Frame) -> None:
+        frame = tk.Frame(parent, bg=self.bg_color)
+        frame.pack(fill="x", padx=10, pady=(2, 6))
+
+        tk.Label(frame, text="Process:", bg=self.bg_color, fg=self.text_color,
+                 font=(self.font_family, 10, "bold")).pack(side=tk.LEFT, padx=(0, 6))
+        self.vo_process_var = tk.StringVar(value=self.config.get("vo_process", "Both"))
+        ttk.Combobox(
+            frame, textvariable=self.vo_process_var, state="readonly", width=12,
+            values=["Both", "Uptin only", "Pat only"], font=(self.font_family, 10),
+        ).pack(side=tk.LEFT)
+        self.vo_process_var.trace_add("write", lambda *_: self._save_config())
+
+        tk.Label(frame, text="Device:", bg=self.bg_color, fg=self.text_color,
+                 font=(self.font_family, 10, "bold")).pack(side=tk.LEFT, padx=(18, 6))
+        self.rvc_device_var = tk.StringVar(value=self.config.get("rvc_device", "Auto"))
+        ttk.Combobox(
+            frame, textvariable=self.rvc_device_var, state="readonly", width=8,
+            values=["Auto", "cuda:0", "cpu"], font=(self.font_family, 10),
+        ).pack(side=tk.LEFT)
+        self.rvc_device_var.trace_add("write", lambda *_: self._save_config())
+
+        tk.Label(frame, text="Title from first", bg=self.bg_color, fg=self.text_color,
+                 font=(self.font_family, 10, "bold")).pack(side=tk.LEFT, padx=(18, 6))
+        self.vo_title_seconds_var = tk.IntVar(value=self.config.get("vo_title_seconds", 5))
+        tk.Spinbox(frame, from_=1, to=30, increment=1, width=4,
+                   textvariable=self.vo_title_seconds_var, font=(self.font_family, 10),
+                   command=self._save_config).pack(side=tk.LEFT)
+        tk.Label(frame, text="s (English)", bg=self.bg_color, fg=self.text_color,
+                 font=(self.font_family, 10)).pack(side=tk.LEFT, padx=(4, 0))
+        self.vo_title_seconds_var.trace_add("write", lambda *_: self._save_config())
+
+        tk.Label(
+            frame, text="(Transcription uses the provider/key set on the Transcription tab)",
+            bg=self.bg_color, fg="#86868B", font=(self.font_family, 9),
+        ).pack(side=tk.LEFT, padx=(16, 0))
+
+    def _build_vo_silence_row(self, parent: tk.Frame) -> None:
+        frame = tk.Frame(parent, bg=self.bg_color)
+        frame.pack(fill="x", padx=10, pady=(2, 8))
+
+        tk.Label(frame, text="Silence —  shorten pauses over",
+                 bg=self.bg_color, fg=self.text_color,
+                 font=(self.font_family, 10, "bold")).pack(side=tk.LEFT, padx=(0, 6))
+
+        self.vo_silence_thresh_var = tk.DoubleVar(value=self.config.get("vo_silence_threshold", 0.1))
+        tk.Spinbox(frame, from_=0.02, to=2.0, increment=0.01, width=5,
+                   textvariable=self.vo_silence_thresh_var, font=(self.font_family, 10),
+                   command=self._save_config).pack(side=tk.LEFT)
+        tk.Label(frame, text="s   down to", bg=self.bg_color, fg=self.text_color,
+                 font=(self.font_family, 10)).pack(side=tk.LEFT, padx=4)
+
+        self.vo_silence_target_var = tk.DoubleVar(value=self.config.get("vo_silence_target", 0.07))
+        tk.Spinbox(frame, from_=0.0, to=1.0, increment=0.01, width=5,
+                   textvariable=self.vo_silence_target_var, font=(self.font_family, 10),
+                   command=self._save_config).pack(side=tk.LEFT)
+        tk.Label(frame, text="s    Noise floor", bg=self.bg_color, fg=self.text_color,
+                 font=(self.font_family, 10)).pack(side=tk.LEFT, padx=4)
+
+        self.vo_noise_db_var = tk.IntVar(value=self.config.get("vo_silence_noise_db", -30))
+        tk.Spinbox(frame, from_=-60, to=-10, increment=1, width=5,
+                   textvariable=self.vo_noise_db_var, font=(self.font_family, 10),
+                   command=self._save_config).pack(side=tk.LEFT)
+        tk.Label(frame, text="dB    Keep", bg=self.bg_color, fg=self.text_color,
+                 font=(self.font_family, 10)).pack(side=tk.LEFT, padx=(4, 4))
+
+        self.vo_silence_pad_var = tk.IntVar(value=self.config.get("vo_silence_pad_ms", 40))
+        tk.Spinbox(frame, from_=0, to=300, increment=5, width=5,
+                   textvariable=self.vo_silence_pad_var, font=(self.font_family, 10),
+                   command=self._save_config).pack(side=tk.LEFT)
+        tk.Label(frame, text="ms around speech", bg=self.bg_color, fg=self.text_color,
+                 font=(self.font_family, 10)).pack(side=tk.LEFT, padx=(4, 0))
+
+        for var in (self.vo_silence_thresh_var, self.vo_silence_target_var,
+                    self.vo_noise_db_var, self.vo_silence_pad_var):
+            var.trace_add("write", lambda *_: self._save_config())
+
+    def _build_vo_voices_row(self, parent: tk.Frame) -> None:
+        wrap = tk.Frame(parent, bg=self.bg_color)
+        wrap.pack(fill="x", padx=10, pady=(2, 8))
+        wrap.grid_columnconfigure(0, weight=1, uniform="voice")
+        wrap.grid_columnconfigure(1, weight=1, uniform="voice")
+        self._build_vo_voice_box(wrap, "uptin", "Uptin", col=0)
+        self._build_vo_voice_box(wrap, "pat", "Pat", col=1)
+
+    def _build_vo_voice_box(self, parent: tk.Frame, voice: str, label: str, col: int) -> None:
+        cfg = self.config.get(f"rvc_{voice}", {}) or {}
+        box = tk.Frame(parent, bg="white", highlightbackground="#D2D2D7", highlightthickness=1)
+        box.grid(row=0, column=col, sticky="nsew", padx=(0, 6) if col == 0 else (6, 0))
+
+        tk.Label(box, text=f"{label} voice  (RVC)", bg="white", fg=self.text_color,
+                 font=(self.font_family, 11, "bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(8, 4))
+
+        pitch_var = tk.IntVar(value=int(cfg.get("pitch", -2)))
+        index_var = tk.DoubleVar(value=float(cfg.get("index_rate", 0)))
+        f0_var = tk.StringVar(value=cfg.get("f0method", "rmvpe"))
+        rms_var = tk.DoubleVar(value=float(cfg.get("rms_mix_rate", 1)))
+        protect_var = tk.DoubleVar(value=float(cfg.get("protect", 0.33)))
+        self.vo_voice_vars[voice] = {
+            "pitch": pitch_var, "index_rate": index_var, "f0method": f0_var,
+            "rms_mix_rate": rms_var, "protect": protect_var,
+        }
+
+        def _field(r: int, text: str, widget: tk.Widget) -> None:
+            tk.Label(box, text=text, bg="white", fg=self.text_color,
+                     font=(self.font_family, 10)).grid(row=r, column=0, sticky="w", padx=10, pady=2)
+            widget.grid(row=r, column=1, sticky="w", padx=(0, 10), pady=2)
+
+        _field(1, "Pitch (semitones)", tk.Spinbox(
+            box, from_=-24, to=24, increment=1, width=6, textvariable=pitch_var,
+            font=(self.font_family, 10), command=self._save_config))
+        _field(2, "Index rate", tk.Spinbox(
+            box, from_=0.0, to=1.0, increment=0.05, width=6, textvariable=index_var,
+            font=(self.font_family, 10), command=self._save_config))
+        _field(3, "f0 method", ttk.Combobox(
+            box, textvariable=f0_var, state="readonly", width=8,
+            values=["rmvpe", "harvest", "crepe", "pm"], font=(self.font_family, 10)))
+        _field(4, "Volume envelope", tk.Spinbox(
+            box, from_=0.0, to=1.0, increment=0.05, width=6, textvariable=rms_var,
+            font=(self.font_family, 10), command=self._save_config))
+        _field(5, "Protect", tk.Spinbox(
+            box, from_=0.0, to=0.5, increment=0.01, width=6, textvariable=protect_var,
+            font=(self.font_family, 10), command=self._save_config))
+        box.grid_rowconfigure(6, minsize=8)
+
+        for var in (pitch_var, index_var, f0_var, rms_var, protect_var):
+            var.trace_add("write", lambda *_: self._save_config())
+
+    def _build_vo_button_row(self, parent: tk.Frame, row: int) -> None:
+        frame = tk.Frame(parent, bg=self.bg_color)
+        frame.grid(row=row, column=0, sticky="ew", pady=(8, 16), padx=10)
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_columnconfigure(1, weight=1)
+
+        self.vo_btn = RoundedButton(
+            frame, text="🎚  Start Voiceover", command=self.start_voiceover,
+            radius=22, bg_color=self.accent_color, hover_color=self.accent_hover,
+            text_color="white", font=(self.font_family, 12, "bold"), height=46,
+        )
+        self.vo_btn.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+
+        self.vo_cancel_btn = RoundedButton(
+            frame, text="Cancel", command=self.cancel_download,
+            radius=22, bg_color="#FF3B30", hover_color="#D70A01",
+            text_color="white", font=(self.font_family, 12, "bold"), height=46,
+        )
+        self.vo_cancel_btn.grid(row=0, column=1, sticky="ew")
+        self.vo_cancel_btn.config_state("disabled", bg="#E5E5EA")
+
+    def _refresh_vo_sources(self) -> None:
+        """Repaint the sources listbox from ``self.vo_sources``."""
+        self.vo_sources_list.delete(0, tk.END)
+        for path in self.vo_sources:
+            tag = "📦 " if path.lower().endswith(".zip") else "📁 "
+            self.vo_sources_list.insert(tk.END, tag + path)
+
+    def _add_vo_sources(self, paths: Sequence[str]) -> None:
+        """Append new, de-duplicated inputs and persist."""
+        added = False
+        for p in paths:
+            norm = os.path.normpath(p)
+            if norm and norm not in self.vo_sources:
+                self.vo_sources.append(norm)
+                added = True
+        if added:
+            self._refresh_vo_sources()
+            self._save_config()
+
+    def vo_add_folder(self) -> None:
+        selected = filedialog.askdirectory(
+            initialdir=self.vo_source_dir or os.path.expanduser("~"),
+            title="Select Folder of Raw Voiceover Clips",
+        )
+        if selected:
+            self.vo_source_dir = os.path.normpath(selected)  # remembered for next time
+            self._add_vo_sources([selected])
+
+    def vo_add_zips(self) -> None:
+        selected = filedialog.askopenfilenames(
+            initialdir=self.vo_source_dir or os.path.expanduser("~"),
+            title="Select Zip Archive(s) of Voiceover Clips",
+            filetypes=[("Zip archives", "*.zip"), ("All files", "*.*")],
+        )
+        if selected:
+            self._add_vo_sources(list(selected))
+
+    def vo_remove_sources(self) -> None:
+        for i in sorted(self.vo_sources_list.curselection(), reverse=True):
+            if 0 <= i < len(self.vo_sources):
+                del self.vo_sources[i]
+        self._refresh_vo_sources()
+        self._save_config()
+
+    def vo_clear_sources(self) -> None:
+        if self.vo_sources:
+            self.vo_sources = []
+            self._refresh_vo_sources()
+            self._save_config()
+
+    def browse_vo_dub(self) -> None:
+        selected = filedialog.askdirectory(
+            initialdir=self.dub_dir or os.path.expanduser("~"),
+            title="Select Dub (Output) Folder",
+        )
+        if selected:
+            self.dub_dir = os.path.normpath(selected)
+            self.vo_dub_label.config(text=self.dub_dir)
+            if hasattr(self, "dub_dir_label"):
+                self.dub_dir_label.config(text=self.dub_dir)
+            self._save_config()
+
+    def _vo_rvc_settings(self, voice: str) -> "voiceover.RvcSettings":
+        """Build an RvcSettings from the UI fields, keeping advanced params from config."""
+        base = self.config.get(f"rvc_{voice}", {}) or {}
+        v = self.vo_voice_vars[voice]
+        return voiceover.RvcSettings(
+            pitch=int(v["pitch"].get()),
+            index_rate=float(v["index_rate"].get()),
+            f0method=v["f0method"].get(),
+            protect=float(v["protect"].get()),
+            rms_mix_rate=float(v["rms_mix_rate"].get()),
+            filter_radius=int(base.get("filter_radius", 3)),
+            resample_sr=int(base.get("resample_sr", 0)),
+        )
+
+    def start_voiceover(self) -> None:
+        """Start button for the Voiceover tab. In the post-batch review state it
+        just returns to the start screen, mirroring the other tabs."""
+        if self.downloading and self.vo_btn.text == "Finish & Return":
+            self.reset_ui()
+            return
+        if self.downloading:
+            return
+
+        sources = [s for s in self.vo_sources
+                   if Path(s).is_dir() or (Path(s).is_file() and s.lower().endswith(".zip"))]
+        if not sources:
+            self.log("[!] Voiceover: add at least one source folder or .zip first.")
+            return
+        if not self.dub_dir:
+            self.log("[!] Voiceover: select a Dub (output) folder first.")
+            return
+
+        rvc_dir = Path(self.config.get("rvc_dir", str(voiceover.DEFAULT_RVC_DIR)))
+        if not (rvc_dir / "infer_batch_rvc.py").exists():
+            self.log(f"[!] Voiceover: RVC not found at {rvc_dir} (set 'rvc_dir' in config.json).")
+            return
+
+        choice = self.vo_process_var.get()
+        voices = {"Both": ["uptin", "pat"], "Uptin only": ["uptin"], "Pat only": ["pat"]}.get(
+            choice, ["uptin", "pat"])
+
+        specs = voiceover.gather_clip_specs(sources, voices)
+        if not specs:
+            self.log(f"[!] Voiceover: no matching '{choice}' clips found across "
+                     f"{len(sources)} source(s).")
+            return
+
+        with self._state_lock:
+            self.downloading = True
+            self.cancelled = False
+        self.cancelled_indices = set()
+        self._vo_candidates = specs
+
+        self.vo_btn.config_state("disabled", text="Processing...", bg="#E5E5EA")
+        self.vo_cancel_btn.config_state("normal", bg="#FF3B30")
+        self.vo_settings_frame.grid_remove()
+
+        titles = [s["name"] for s in specs]
+        self.vo_manager = DownloadManager(
+            self.vo_tab, titles,
+            self._vo_skip_item, self._vo_skip_item, self._vo_skip_item,
+            None, self.bg_color, self.text_color, self.accent_color, self.font_family,
+        )
+        self.vo_manager.grid(row=2, column=0, sticky="nsew", pady=(0, 15))
+
+        threading.Thread(target=self._voiceover_worker, args=(specs,), daemon=True).start()
+
+    def _vo_skip_item(self, index: int) -> None:
+        with self._state_lock:
+            self.cancelled_indices.add(index)
+            if self.vo_manager:
+                self.vo_manager.set_item_status(index, "Skipped", "#34C759")
+
+    def _vo_status(self, index: int, text: str, color: str) -> None:
+        if self.vo_manager:
+            self.root.after(0, self.vo_manager.set_item_status, index, text, color)
+
+    def _make_sync_aligner(self) -> Optional[WhisperAligner]:
+        """Create the alignment model for Sync, honouring the chosen model size."""
+        model_name = self.sync_model_var.get() if hasattr(self, "sync_model_var") else "small"
+        return WhisperAligner.try_create(self.log, model_name=model_name)
+
+    def _make_groq_transcriber(self) -> GroqTranscriber:
+        """Build a GroqTranscriber. Groq needs the system/VPN proxy in regions
+        where api.groq.com is blocked, so we always honour environment proxies
+        (trust_env=True); an explicit proxy URL, if set, takes precedence. The
+        'Disable System Proxy' toggle is yt-dlp-only and intentionally not applied
+        here."""
+        return GroqTranscriber(self.log, self.groq_key_var.get(),
+                               proxy=self.proxy_url_var.get().strip())
+
+    def _vo_transcribe_with_retry(self, transcriber, audio_path: str, name: str,
+                                  attempts: int = 3) -> Optional[str]:
+        """Transcribe forced to English, retrying on transient failures (e.g. a
+        dropped SSL connection to Groq) so a network blip doesn't lose a clip."""
+        for attempt in range(1, attempts + 1):
+            if self._is_cancelled():
+                return None
+            transcript = transcriber.transcribe_to_text(
+                audio_path, is_cancelled=self._is_cancelled, language="en",
+            )
+            if transcript:
+                return transcript
+            if attempt < attempts and not self._is_cancelled():
+                self.log(f"-> Transcription attempt {attempt} failed for {name}, retrying…")
+                time.sleep(2)
+        return None
+
+    def _voiceover_worker(self, specs: List[Dict]) -> None:
+        self.log(f"\n--- Starting Voiceover ({len(specs)} clips) ---")
+        rvc_dir = Path(self.config.get("rvc_dir", str(voiceover.DEFAULT_RVC_DIR)))
+        ffmpeg = str(BASE_PATH / "ffmpeg.exe")
+        dub_dir = Path(self.dub_dir)
+        dub_dir.mkdir(parents=True, exist_ok=True)
+
+        # Transcription provider reuses the Transcription tab's settings.
+        provider = self.trans_provider_var.get()
+        if provider == "Groq AI (Fastest)":
+            transcriber = self._make_groq_transcriber()
+        else:
+            transcriber = WhisperAligner.try_create(self.log)
+        if not transcriber:
+            self.log("[!] Voiceover: failed to initialize transcription provider.")
+            self.root.after(0, self.reset_ui)
+            return
+
+        device, is_half = voiceover.resolve_device(rvc_dir, self.config.get("rvc_device", "Auto"))
+        self.log(f"-> RVC device: {device} (half precision: {is_half})")
+
+        try:
+            thresh = float(self.vo_silence_thresh_var.get())
+            target = float(self.vo_silence_target_var.get())
+            noise_db = float(self.vo_noise_db_var.get())
+            pad = float(self.vo_silence_pad_var.get()) / 1000.0  # ms -> seconds
+            title_seconds = float(self.vo_title_seconds_var.get())
+        except (ValueError, tk.TclError):
+            thresh, target, noise_db, pad, title_seconds = 0.1, 0.07, -30.0, 0.04, 5.0
+
+        temp_root = Path(tempfile.mkdtemp(prefix="vo_"))
+        extract_dir = temp_root / "_src"  # zip members are unpacked here on demand
+        # Reserve titles already present in the Dub folder so we never clobber.
+        used_titles = {p.stem for p in dub_dir.glob("*") if p.is_file()}
+        # voice -> list of (index, title, prepared_wav_path)
+        prepared: Dict[str, List[Tuple[int, str, Path]]] = {"uptin": [], "pat": []}
+
+        # --- Stage 1: per-clip transcribe + rename + silence shorten ---
+        for index, spec in enumerate(specs):
+            if self._is_cancelled() or index in self.cancelled_indices:
+                continue
+            voice, name = spec["voice"], spec["name"]
+
+            # Resolve the clip to a real file (extracting from its zip if needed).
+            if spec["kind"] == "zip":
+                try:
+                    path = voiceover.extract_member(spec["path"], spec["member"], extract_dir)
+                except (OSError, KeyError) as e:
+                    self.log(f"[!] Could not extract {name} from {Path(spec['path']).name}: {e}")
+                    self._vo_status(index, "Failed (Zip)", "#FF3B30")
+                    continue
+            else:
+                path = spec["path"]
+
+            # Title = the English words spoken in the first few seconds. Transcribe
+            # only that opening window, forced to English, so the long Persian body
+            # never becomes the filename.
+            self._vo_status(index, "Transcribing title…", self.accent_color)
+            title_clip = temp_root / voice / "title" / f"{index}.wav"
+            if not voiceover.trim_clip(ffmpeg, str(path), str(title_clip), title_seconds, log=self.log):
+                title_clip = path  # fall back to the whole clip if the trim fails
+
+            transcript = self._vo_transcribe_with_retry(transcriber, str(title_clip), name)
+            if self._is_cancelled():
+                break
+            if not transcript:
+                self.log(f"[!] No transcript for {name} after retries — skipping.")
+                self._vo_status(index, "Failed (Title)", "#FF3B30")
+                continue
+            title_text = voiceover.english_title_from_transcript(transcript)
+            if not title_text or title_text == "untitled":
+                title_text = Path(name).stem  # keep the original name rather than 'untitled'
+            title = voiceover.unique_title(title_text, used_titles)
+            self.log(f"-> {name}  →  \"{title}\"  ({voice})")
+
+            self._vo_status(index, "Trimming silence…", self.accent_color)
+            in_dir = temp_root / voice / "in"
+            prepared_wav = in_dir / f"{title}.wav"
+            ok = voiceover.shorten_silences(
+                ffmpeg, str(path), str(prepared_wav),
+                threshold=thresh, target=target, noise_db=noise_db, pad=pad, log=self.log,
+            )
+            if ok and prepared_wav.exists():
+                prepared[voice].append((index, title, prepared_wav))
+                self._vo_status(index, "Queued for voice…", "#FF9F0A")
+            else:
+                self._vo_status(index, "Failed (Silence)", "#FF3B30")
+
+        # --- Stage 2: RVC conversion, one batch per voice ---
+        for voice, items in prepared.items():
+            if not items or self._is_cancelled():
+                continue
+            in_dir = temp_root / voice / "in"
+            out_dir = temp_root / voice / "out"
+            for idx, _title, _wav in items:
+                self._vo_status(idx, "Converting voice…", self.accent_color)
+
+            ok = voiceover.run_rvc(
+                rvc_dir, voice, self._vo_rvc_settings(voice), device, is_half,
+                str(in_dir), str(out_dir), log=self.log,
+                register=lambda p: self._add_active_process(90000, p),
+                unregister=lambda p: self._remove_active_process(90000),
+            )
+
+            for idx, title, _wav in items:
+                src = out_dir / f"{title}.wav"
+                if ok and src.exists():
+                    try:
+                        shutil.move(str(src), str(dub_dir / f"{title}.wav"))
+                        self._vo_status(idx, "Finished", "#34C759")
+                    except OSError as e:
+                        self.log(f"[!] Could not move {title}.wav to Dub folder: {e}")
+                        self._vo_status(idx, "Failed (Save)", "#FF3B30")
+                else:
+                    self._vo_status(idx, "Failed (RVC)", "#FF3B30")
+
+        try:
+            shutil.rmtree(temp_root, ignore_errors=True)
+        except OSError:
+            pass
+
+        if self._is_cancelled():
+            self.log("\nVoiceover cancelled by user.")
+            self.root.after(0, self.reset_ui)
+        else:
+            self.log("\n--- Voiceover Complete ---")
+            self.log(f"Dubs saved in: {dub_dir}")
+            self.root.after(0, self._vo_show_done)
+
+    def _vo_show_done(self) -> None:
+        """Post-batch review state: Finish & Return, plus jump to the Dub folder."""
+        self.vo_btn.config_state("normal", text="Finish & Return", bg="#34C759")
+        self.vo_cancel_btn.command = lambda: self._open_folder(Path(self.dub_dir))
+        self.vo_cancel_btn.config_state("normal", text="📂  Open Dub Folder", bg=self.accent_color)
+
     def _build_advanced_row(self, parent: tk.Frame, row: int) -> None:
         frame = tk.Frame(parent, bg=self.bg_color)
         frame.grid(row=row, column=0, sticky="ew", pady=(0, 6), padx=10)
@@ -846,7 +1437,44 @@ class AppleStyleApp:
         self.config.set("trans_max_concurrent", self.trans_max_concurrent_var.get())
         self.config.set("trans_use_browser_cookies", self.trans_use_browser_cookies.get())
         self.config.set("export_ttml", self.export_ttml_var.get())
+        if hasattr(self, "sync_fill_gaps_var"):
+            self.config.set("sync_fill_gaps", self.sync_fill_gaps_var.get())
+        if hasattr(self, "sync_model_var"):
+            self.config.set("sync_model", self.sync_model_var.get())
+        self._save_voiceover_config()
         self.config.save()
+
+    def _save_voiceover_config(self) -> None:
+        """Persist Voiceover tab fields. Guarded so a partially-typed numeric
+        field (which makes a DoubleVar.get() raise) never aborts the whole save."""
+        if not hasattr(self, "vo_process_var"):
+            return
+        self.config.set("vo_source_dir", self.vo_source_dir)
+        self.config.set("vo_sources", list(self.vo_sources))
+        self.config.set("vo_process", self.vo_process_var.get())
+        self.config.set("rvc_device", self.rvc_device_var.get())
+        try:
+            self.config.set("vo_silence_threshold", float(self.vo_silence_thresh_var.get()))
+            self.config.set("vo_silence_target", float(self.vo_silence_target_var.get()))
+            self.config.set("vo_silence_noise_db", int(self.vo_noise_db_var.get()))
+            self.config.set("vo_silence_pad_ms", int(self.vo_silence_pad_var.get()))
+            self.config.set("vo_title_seconds", int(self.vo_title_seconds_var.get()))
+        except (ValueError, tk.TclError):
+            pass
+        for voice in ("uptin", "pat"):
+            base = dict(self.config.get(f"rvc_{voice}", {}) or {})
+            v = self.vo_voice_vars.get(voice, {})
+            try:
+                base.update({
+                    "pitch": int(v["pitch"].get()),
+                    "index_rate": float(v["index_rate"].get()),
+                    "f0method": v["f0method"].get(),
+                    "rms_mix_rate": float(v["rms_mix_rate"].get()),
+                    "protect": float(v["protect"].get()),
+                })
+            except (KeyError, ValueError, tk.TclError):
+                pass
+            self.config.set(f"rvc_{voice}", base)
 
     def browse_directory(self) -> None:
         selected = filedialog.askdirectory(
@@ -1121,8 +1749,8 @@ class AppleStyleApp:
             self.log(f"-> Manual retry started for item {index + 1}...")
             aligner: Optional[WhisperAligner] = None
             if sync_mode == "Whisper AI (Smart Sync)":
-                aligner = WhisperAligner.try_create(self.log)
-            
+                aligner = self._make_sync_aligner()
+
             success = self._download_item_worker(
                 index, title, link, subs, aligner, is_retry=True
             )
@@ -1479,7 +2107,7 @@ class AppleStyleApp:
     ) -> None:
         aligner: Optional[WhisperAligner] = None
         if sync_mode == "Whisper AI (Smart Sync)":
-            aligner = WhisperAligner.try_create(self.log)
+            aligner = self._make_sync_aligner()
             if aligner is None:
                 sync_mode = "None (2-second intervals)"
 
@@ -1608,6 +2236,7 @@ class AppleStyleApp:
                 try:
                     whisper_success = aligner.align(
                         audio_source, subs, srt_path, is_cancelled=self._is_cancelled,
+                        fill_gaps=self.sync_fill_gaps_var.get(),
                     )
                 except Exception as e:
                     logger.exception("Whisper sync failed for %s", title)
@@ -1877,7 +2506,7 @@ class AppleStyleApp:
 
     def _sync_process(self, chosen: List[dict]) -> None:
         self.log(f"\n--- Starting Subtitle Sync ({len(chosen)} item(s)) ---")
-        aligner = WhisperAligner.try_create(self.log)
+        aligner = self._make_sync_aligner()
         if aligner is None:
             self.log("[!] Whisper is not available; cannot sync. Install the Whisper dependencies.")
             self.root.after(0, self.reset_ui)
@@ -1938,6 +2567,7 @@ class AppleStyleApp:
         try:
             ok = aligner.align(
                 item["audio_path"], cues, out_srt, is_cancelled=self._is_cancelled,
+                fill_gaps=self.sync_fill_gaps_var.get(),
             )
         except Exception as e:
             logger.exception("Whisper sync failed for %s", title)
@@ -1972,7 +2602,7 @@ class AppleStyleApp:
         item = self._sync_chosen[index]
 
         def _worker():
-            aligner = WhisperAligner.try_create(self.log)
+            aligner = self._make_sync_aligner()
             if aligner is None:
                 if self.sync_manager:
                     self.root.after(0, self.sync_manager.set_item_status, index, "Failed (AI Init)", "#FF3B30")
@@ -2068,10 +2698,10 @@ class AppleStyleApp:
             provider = self.trans_provider_var.get()
             transcriber = None
             if provider == "Groq AI (Fastest)":
-                transcriber = GroqTranscriber(self.log, self.groq_key_var.get(), proxy=self.proxy_url_var.get().strip())
+                transcriber = self._make_groq_transcriber()
             else:
                 transcriber = WhisperAligner.try_create(self.log)
-                
+
             if not transcriber:
                 self.root.after(0, self.trans_manager.set_item_status, index, "Failed (AI Init)", "#FF3B30")
                 return
@@ -2170,7 +2800,7 @@ class AppleStyleApp:
         
         transcriber = None
         if provider == "Groq AI (Fastest)":
-            transcriber = GroqTranscriber(self.log, self.groq_key_var.get(), proxy=self.proxy_url_var.get().strip())
+            transcriber = self._make_groq_transcriber()
         else:
             transcriber = WhisperAligner.try_create(self.log)
 
@@ -2341,6 +2971,15 @@ class AppleStyleApp:
         if hasattr(self, "sync_select_frame"):
             self.sync_select_frame.grid()
 
+        # Reset Voiceover Tab
+        if hasattr(self, "vo_btn"):
+            self.vo_btn.config_state("normal", text="🎚  Start Voiceover", bg=self.accent_color)
+            # The Cancel button doubles as 'Open Dub Folder' in the review state.
+            self.vo_cancel_btn.command = self.cancel_download
+            self.vo_cancel_btn.config_state("disabled", text="Cancel", bg="#E5E5EA")
+        if hasattr(self, "vo_settings_frame"):
+            self.vo_settings_frame.grid()
+
         # Clean up managers
         if hasattr(self, "download_manager") and self.download_manager:
             self.download_manager.destroy()
@@ -2353,6 +2992,10 @@ class AppleStyleApp:
         if hasattr(self, "sync_manager") and self.sync_manager:
             self.sync_manager.destroy()
             self.sync_manager = None
+
+        if hasattr(self, "vo_manager") and self.vo_manager:
+            self.vo_manager.destroy()
+            self.vo_manager = None
             
         self.dl_input_text.config(state="normal", bg="white")
         self.trans_input_text.config(state="normal", bg="white")
