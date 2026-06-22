@@ -29,13 +29,56 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Default install location of the Mangio-RVC interface. Overridable via config
-# ("rvc_dir") in case the user moves it.
+# A typical install location of the Mangio-RVC interface; only one of several
+# candidates that find_rvc_dir() probes. The actual path is auto-detected and/or
+# set via the UI ("rvc_dir" in config), so the app is not tied to one machine.
 DEFAULT_RVC_DIR = Path(r"C:\Users\erfsa\Desktop\Mangio-RVC-v23.7.0")
 
 # Our corrected batch inference script (the one bundled with Mangio v23.7.0 is
 # stale and crashes). Lives alongside this module; run from the Mangio dir.
 BATCH_SCRIPT = Path(__file__).resolve().parent / "rvc_batch.py"
+
+
+def is_rvc_dir(path) -> bool:
+    """True if ``path`` looks like a usable Mangio-RVC install (has the bundled
+    Python runtime and the inference module our batch runner imports)."""
+    if not path:
+        return False
+    p = Path(path)
+    return (p / "runtime" / "python.exe").is_file() and (p / "vc_infer_pipeline.py").is_file()
+
+
+def find_rvc_dir(configured: str = "") -> Optional[Path]:
+    """Locate the Mangio-RVC folder so the app works on any machine.
+
+    Checks the configured path first, then common spots (Desktop, home, next to
+    the app), then globs for any ``Mangio-RVC*`` folder in those bases. Returns
+    the first valid match, or None if nothing is found."""
+    app_dir = Path(__file__).resolve().parent
+    home = Path.home()
+    bases = [home / "Desktop", home, app_dir, app_dir.parent]
+
+    candidates: List[Path] = []
+    if configured:
+        candidates.append(Path(configured))
+    candidates.append(DEFAULT_RVC_DIR)
+    for base in bases:
+        candidates.append(base / "Mangio-RVC-v23.7.0")
+    for base in bases:
+        try:
+            candidates.extend(sorted(base.glob("Mangio-RVC*")))
+        except OSError:
+            pass
+
+    seen = set()
+    for c in candidates:
+        key = str(c).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if is_rvc_dir(c):
+            return c
+    return None
 
 # Voice routing. Each entry maps a voice id to its trained model (.pth), its
 # feature index (.index), and the filename prefixes that select it. Paths are

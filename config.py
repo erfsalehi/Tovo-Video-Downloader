@@ -34,7 +34,7 @@ DEFAULTS: dict[str, Any] = {
     "vo_silence_noise_db": -30,
     "vo_silence_pad_ms": 40,
     "vo_title_seconds": 5,
-    "rvc_dir": r"C:\Users\erfsa\Desktop\Mangio-RVC-v23.7.0",
+    "rvc_dir": "",
     "rvc_device": "Auto",
     "rvc_uptin": {
         "pitch": -2, "index_rate": 0, "f0method": "rmvpe", "protect": 0.33,

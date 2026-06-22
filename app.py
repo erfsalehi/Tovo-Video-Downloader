@@ -111,6 +111,12 @@ class AppleStyleApp:
         self.vo_sources: List[str] = list(self.config.get("vo_sources", []) or [])
         if not self.vo_sources and self.vo_source_dir:
             self.vo_sources = [self.vo_source_dir]
+        # Locate the Mangio-RVC folder (auto-detect if the saved path is missing,
+        # e.g. on a different machine) so the Voiceover tab works everywhere.
+        self.rvc_dir = self.config.get("rvc_dir", "")
+        _rvc_found = voiceover.find_rvc_dir(self.rvc_dir)
+        if _rvc_found:
+            self.rvc_dir = str(_rvc_found)
         self.downloads_dir.mkdir(parents=True, exist_ok=True)
         self.trans_dir.mkdir(parents=True, exist_ok=True)
 
@@ -793,6 +799,23 @@ class AppleStyleApp:
             font=(self.font_family, 10, "bold"), width=90, height=32,
         ).grid(row=0, column=2, sticky="e", padx=(6, 0))
 
+        # RVC (Mangio) folder - auto-detected, but browsable for other machines.
+        rvc = tk.Frame(parent, bg=self.bg_color)
+        rvc.pack(fill="x", padx=10, pady=(0, 6))
+        rvc.grid_columnconfigure(1, weight=1)
+        tk.Label(rvc, text="RVC Folder:", bg=self.bg_color, fg=self.text_color,
+                 font=(self.font_family, 10, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.rvc_dir_label = tk.Label(
+            rvc, text=self.rvc_dir or "Not found — click Browse", bg=self.bg_color,
+            fg="#5E5CE6" if self.rvc_dir else "#FF3B30", font=(self.font_family, 10), anchor="w",
+        )
+        self.rvc_dir_label.grid(row=0, column=1, sticky="ew")
+        RoundedButton(
+            rvc, text="Browse…", command=self.browse_rvc_dir, radius=14,
+            bg_color=self.gray_bg, hover_color=self.gray_hover, text_color=self.text_color,
+            font=(self.font_family, 10, "bold"), width=90, height=32,
+        ).grid(row=0, column=2, sticky="e", padx=(6, 0))
+
     def _build_vo_options_row(self, parent: tk.Frame) -> None:
         frame = tk.Frame(parent, bg=self.bg_color)
         frame.pack(fill="x", padx=10, pady=(2, 6))
@@ -1005,6 +1028,32 @@ class AppleStyleApp:
                 self.dub_dir_label.config(text=self.dub_dir)
             self._save_config()
 
+    def browse_rvc_dir(self) -> None:
+        selected = filedialog.askdirectory(
+            initialdir=self.rvc_dir or os.path.expanduser("~"),
+            title="Select the Mangio-RVC Folder",
+        )
+        if not selected:
+            return
+        if voiceover.is_rvc_dir(selected):
+            self.rvc_dir = os.path.normpath(selected)
+            self.rvc_dir_label.config(text=self.rvc_dir, fg="#5E5CE6")
+            self._save_config()
+            self.log(f"-> RVC folder set: {self.rvc_dir}")
+        else:
+            self.log("[!] That folder doesn't look like a Mangio-RVC install "
+                     "(needs runtime\\python.exe and vc_infer_pipeline.py).")
+
+    def _resolve_rvc_dir(self) -> Optional[Path]:
+        """Return a valid RVC folder, re-detecting and persisting it if needed."""
+        found = voiceover.find_rvc_dir(self.rvc_dir)
+        if found:
+            self.rvc_dir = str(found)
+            if hasattr(self, "rvc_dir_label"):
+                self.rvc_dir_label.config(text=self.rvc_dir, fg="#5E5CE6")
+            self._save_config()
+        return found
+
     def _vo_rvc_settings(self, voice: str) -> "voiceover.RvcSettings":
         """Build an RvcSettings from the UI fields, keeping advanced params from config."""
         base = self.config.get(f"rvc_{voice}", {}) or {}
@@ -1037,9 +1086,10 @@ class AppleStyleApp:
             self.log("[!] Voiceover: select a Dub (output) folder first.")
             return
 
-        rvc_dir = Path(self.config.get("rvc_dir", str(voiceover.DEFAULT_RVC_DIR)))
-        if not (rvc_dir / "infer_batch_rvc.py").exists():
-            self.log(f"[!] Voiceover: RVC not found at {rvc_dir} (set 'rvc_dir' in config.json).")
+        rvc_dir = self._resolve_rvc_dir()
+        if rvc_dir is None:
+            self.log("[!] Voiceover: Mangio-RVC folder not found. Click 'Browse…' next to "
+                     "'RVC Folder' to select your Mangio-RVC-v23.7.0 folder.")
             return
 
         choice = self.vo_process_var.get()
@@ -1115,7 +1165,7 @@ class AppleStyleApp:
 
     def _voiceover_worker(self, specs: List[Dict]) -> None:
         self.log(f"\n--- Starting Voiceover ({len(specs)} clips) ---")
-        rvc_dir = Path(self.config.get("rvc_dir", str(voiceover.DEFAULT_RVC_DIR)))
+        rvc_dir = Path(self.rvc_dir)
         ffmpeg = str(BASE_PATH / "ffmpeg.exe")
         dub_dir = Path(self.dub_dir)
         dub_dir.mkdir(parents=True, exist_ok=True)
@@ -1451,6 +1501,7 @@ class AppleStyleApp:
             return
         self.config.set("vo_source_dir", self.vo_source_dir)
         self.config.set("vo_sources", list(self.vo_sources))
+        self.config.set("rvc_dir", self.rvc_dir)
         self.config.set("vo_process", self.vo_process_var.get())
         self.config.set("rvc_device", self.rvc_device_var.get())
         try:
