@@ -147,6 +147,23 @@ def detect_voice(filename: str) -> Optional[str]:
     return None
 
 
+def classify_clip(filename: str) -> Optional[Tuple[str, bool]]:
+    """Classify a clip into ``(voice, keep_title)`` or None if it isn't one.
+
+    ``keep_title=True`` means the filename is already the desired title, so the
+    clip is only de-silenced and voice-converted (no transcription/rename). This
+    is triggered by a ``pat long`` marker (e.g. "pat long - china economy"), used
+    for long-form pat videos whose title is supplied in the filename.
+    """
+    stem = Path(filename).stem.strip().lower()
+    if re.match(r"^(pat|patrick)\b[\s_\-.]*long\b", stem):
+        return ("pat", True)
+    voice = detect_voice(filename)
+    if voice:
+        return (voice, False)
+    return None
+
+
 def title_from_transcript(text: str, max_len: int = 120) -> str:
     """Turn a transcript into a safe, reasonably short filename stem."""
     text = re.sub(r"\s+", " ", text or "").strip()
@@ -443,9 +460,10 @@ def gather_clip_specs(inputs: List[str], voices: List[str]) -> List[Dict]:
     (its members are listed but not yet extracted). Returns a list of specs::
 
         {"kind": "file"|"zip", "path": Path, "member": str|None,
-         "voice": str, "name": str}
+         "voice": str, "name": str, "keep_title": bool}
 
-    Only clips whose filename prefix maps to one of ``voices`` are included.
+    Only clips whose filename maps to one of ``voices`` are included.
+    ``keep_title`` flags "<voice> long" clips that skip transcription/rename.
     Zip members are extracted lazily later via :func:`extract_member` so building
     this list stays cheap even for large archives."""
     specs: List[Dict] = []
@@ -455,10 +473,11 @@ def gather_clip_specs(inputs: List[str], voices: List[str]) -> List[Dict]:
             for entry in sorted(p.iterdir(), key=lambda x: x.name.lower()):
                 if not entry.is_file() or entry.suffix.lower() not in AUDIO_EXTS:
                     continue
-                voice = detect_voice(entry.name)
-                if voice and voice in voices:
+                info = classify_clip(entry.name)
+                if info and info[0] in voices:
                     specs.append({"kind": "file", "path": entry, "member": None,
-                                  "voice": voice, "name": entry.name})
+                                  "voice": info[0], "keep_title": info[1],
+                                  "name": entry.name})
         elif p.is_file() and p.suffix.lower() == ".zip":
             try:
                 with zipfile.ZipFile(p) as zf:
@@ -468,10 +487,11 @@ def gather_clip_specs(inputs: List[str], voices: List[str]) -> List[Dict]:
                         base = Path(member).name
                         if Path(base).suffix.lower() not in AUDIO_EXTS:
                             continue
-                        voice = detect_voice(base)
-                        if voice and voice in voices:
+                        info = classify_clip(base)
+                        if info and info[0] in voices:
                             specs.append({"kind": "zip", "path": p, "member": member,
-                                          "voice": voice, "name": base})
+                                          "voice": info[0], "keep_title": info[1],
+                                          "name": base})
             except (zipfile.BadZipFile, OSError) as e:
                 logger.warning("Could not read zip %s: %s", p, e)
     return specs

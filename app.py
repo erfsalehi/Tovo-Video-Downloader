@@ -1170,16 +1170,19 @@ class AppleStyleApp:
         dub_dir = Path(self.dub_dir)
         dub_dir.mkdir(parents=True, exist_ok=True)
 
-        # Transcription provider reuses the Transcription tab's settings.
-        provider = self.trans_provider_var.get()
-        if provider == "Groq AI (Fastest)":
-            transcriber = self._make_groq_transcriber()
-        else:
-            transcriber = WhisperAligner.try_create(self.log)
-        if not transcriber:
-            self.log("[!] Voiceover: failed to initialize transcription provider.")
-            self.root.after(0, self.reset_ui)
-            return
+        # A transcriber is only needed for clips that get re-titled; "pat long"
+        # clips keep their filename, so an all-"pat long" batch needs none.
+        transcriber = None
+        if any(not s.get("keep_title") for s in specs):
+            provider = self.trans_provider_var.get()
+            if provider == "Groq AI (Fastest)":
+                transcriber = self._make_groq_transcriber()
+            else:
+                transcriber = WhisperAligner.try_create(self.log)
+            if not transcriber:
+                self.log("[!] Voiceover: failed to initialize transcription provider.")
+                self.root.after(0, self.reset_ui)
+                return
 
         device, is_half = voiceover.resolve_device(rvc_dir, self.config.get("rvc_device", "Auto"))
         self.log(f"-> RVC device: {device} (half precision: {is_half})")
@@ -1217,26 +1220,31 @@ class AppleStyleApp:
             else:
                 path = spec["path"]
 
-            # Title = the English words spoken in the first few seconds. Transcribe
-            # only that opening window, forced to English, so the long Persian body
-            # never becomes the filename.
-            self._vo_status(index, "Transcribing title…", self.accent_color)
-            title_clip = temp_root / voice / "title" / f"{index}.wav"
-            if not voiceover.trim_clip(ffmpeg, str(path), str(title_clip), title_seconds, log=self.log):
-                title_clip = path  # fall back to the whole clip if the trim fails
+            if spec.get("keep_title"):
+                # "pat long" clips keep their filename as the title — no transcription.
+                title = voiceover.unique_title(Path(name).stem, used_titles)
+                self.log(f"-> {name}  (keeping title, {voice})")
+            else:
+                # Title = the English words spoken in the first few seconds. Transcribe
+                # only that opening window, forced to English, so the long Persian body
+                # never becomes the filename.
+                self._vo_status(index, "Transcribing title…", self.accent_color)
+                title_clip = temp_root / voice / "title" / f"{index}.wav"
+                if not voiceover.trim_clip(ffmpeg, str(path), str(title_clip), title_seconds, log=self.log):
+                    title_clip = path  # fall back to the whole clip if the trim fails
 
-            transcript = self._vo_transcribe_with_retry(transcriber, str(title_clip), name)
-            if self._is_cancelled():
-                break
-            if not transcript:
-                self.log(f"[!] No transcript for {name} after retries — skipping.")
-                self._vo_status(index, "Failed (Title)", "#FF3B30")
-                continue
-            title_text = voiceover.english_title_from_transcript(transcript)
-            if not title_text or title_text == "untitled":
-                title_text = Path(name).stem  # keep the original name rather than 'untitled'
-            title = voiceover.unique_title(title_text, used_titles)
-            self.log(f"-> {name}  →  \"{title}\"  ({voice})")
+                transcript = self._vo_transcribe_with_retry(transcriber, str(title_clip), name)
+                if self._is_cancelled():
+                    break
+                if not transcript:
+                    self.log(f"[!] No transcript for {name} after retries — skipping.")
+                    self._vo_status(index, "Failed (Title)", "#FF3B30")
+                    continue
+                title_text = voiceover.english_title_from_transcript(transcript)
+                if not title_text or title_text == "untitled":
+                    title_text = Path(name).stem  # keep the original name rather than 'untitled'
+                title = voiceover.unique_title(title_text, used_titles)
+                self.log(f"-> {name}  →  \"{title}\"  ({voice})")
 
             self._vo_status(index, "Trimming silence…", self.accent_color)
             in_dir = temp_root / voice / "in"
