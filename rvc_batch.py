@@ -14,17 +14,45 @@ Positional args:
   device is_half filter_radius resample_sr rms_mix_rate protect [crepe_hop_length]
 
 Every ``.wav`` in ``input_dir`` is converted and written, under the same name,
-into ``opt_dir``.
+into ``opt_dir``. Progress is reported on stdout as machine-readable lines so the
+caller can update a UI per file:
+
+  RVC_TOTAL\t<n>
+  RVC_START\t<filename>
+  RVC_DONE\t<filename>
+  RVC_FAIL\t<filename>
+
+Notes on robustness:
+- We seed the in-memory ``formant_data`` table (as Mangio's web UI does) with
+  DoFormant=0, otherwise ``my_utils.load_audio`` reads a stale/missing value and
+  runs a per-file ``stftpitchshift`` via ``os.system()`` — which pops a console
+  window for every clip on Windows.
+- The executable part is guarded by ``if __name__ == '__main__'`` with
+  ``freeze_support()`` so nothing re-spawns under Windows' spawn start method.
 """
 import os
+import sqlite3
 import sys
 
 import torch
-import tqdm as tq
 from multiprocessing import cpu_count
 
 now_dir = os.getcwd()
 sys.path.append(now_dir)
+
+from vc_infer_pipeline import VC
+from lib.infer_pack.models import (
+    SynthesizerTrnMs256NSFsid,
+    SynthesizerTrnMs256NSFsid_nono,
+    SynthesizerTrnMs768NSFsid,
+    SynthesizerTrnMs768NSFsid_nono,
+)
+from my_utils import load_audio
+from fairseq import checkpoint_utils
+from scipy.io import wavfile
+
+hubert_model = None
+_formant_conn = None  # kept open for the process lifetime (shared in-memory cache)
 
 
 class Config:
@@ -76,36 +104,31 @@ class Config:
         return x_pad, x_query, x_center, x_max
 
 
-f0up_key = sys.argv[1]
-input_path = sys.argv[2]
-index_path = sys.argv[3]
-f0method = sys.argv[4]
-opt_path = sys.argv[5]
-model_path = sys.argv[6]
-index_rate = float(sys.argv[7])
-device = sys.argv[8]
-is_half = sys.argv[9].lower() != "false"
-filter_radius = int(sys.argv[10])
-resample_sr = int(sys.argv[11])
-rms_mix_rate = float(sys.argv[12])
-protect = float(sys.argv[13])
-crepe_hop_length = int(sys.argv[14]) if len(sys.argv) > 14 else 128
-
-config = Config(device, is_half)
-device = config.device  # honour CPU/MPS fallback from device_config
-
-from vc_infer_pipeline import VC
-from lib.infer_pack.models import (
-    SynthesizerTrnMs256NSFsid,
-    SynthesizerTrnMs256NSFsid_nono,
-    SynthesizerTrnMs768NSFsid,
-    SynthesizerTrnMs768NSFsid_nono,
-)
-from my_utils import load_audio
-from fairseq import checkpoint_utils
-from scipy.io import wavfile
-
-hubert_model = None
+def setup_formant_db():
+    """Ensure the in-memory formant DB exists with DoFormant=0 (mirrors
+    infer-web.py). Without this, ``my_utils.load_audio`` either crashes on a
+    missing table or honours a leftover DoFormant=1 and shells out to
+    ``stftpitchshift`` per file, opening a console window each time."""
+    global _formant_conn
+    try:
+        os.makedirs("TEMP", exist_ok=True)
+        _formant_conn = sqlite3.connect(
+            "TEMP/db:cachedb?mode=memory&cache=shared", check_same_thread=False
+        )
+        cur = _formant_conn.cursor()
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS formant_data "
+            "(Quefrency FLOAT, Timbre FLOAT, DoFormant INTEGER)"
+        )
+        cur.execute("CREATE TABLE IF NOT EXISTS stop_train (stop BOOL)")
+        cur.execute("DELETE FROM formant_data")
+        cur.execute(
+            "INSERT INTO formant_data (Quefrency, Timbre, DoFormant) VALUES (?, ?, ?)",
+            (8.0, 1.2, 0),
+        )
+        _formant_conn.commit()
+    except Exception as e:  # never let DB setup abort a conversion
+        print("  formant DB setup warning: %r" % e, flush=True)
 
 
 def load_hubert():
@@ -124,7 +147,7 @@ def vc_single(sid, input_audio, f0_up_key, f0_file, f0_method, file_index, index
         return None
     f0_up_key = int(f0_up_key)
     # load_audio now requires (file, sr, DoFormant, Quefrency, Timbre); the formant
-    # values are also re-read from Mangio's TEMP DB, so plain defaults are fine.
+    # values are re-read from the TEMP DB (seeded to DoFormant=0 by setup_formant_db).
     audio = load_audio(input_audio, 16000, False, 0.0, 0.0)
     times = [0, 0, 0]
     if hubert_model is None:
@@ -161,12 +184,52 @@ def get_vc(model_path):
     n_spk = cpt["config"][-3]
 
 
-get_vc(model_path)
-os.makedirs(opt_path, exist_ok=True)
-for file in tq.tqdm(os.listdir(input_path)):
-    if not file.lower().endswith(".wav"):
-        continue
-    file_path = os.path.join(input_path, file)
-    wav_opt = vc_single(0, file_path, f0up_key, None, f0method, index_path, index_rate)
-    if wav_opt is not None:
-        wavfile.write(os.path.join(opt_path, file), tgt_sr, wav_opt)
+def main():
+    global f0up_key, input_path, index_path, f0method, opt_path, model_path
+    global index_rate, device, is_half, filter_radius, resample_sr, rms_mix_rate
+    global protect, crepe_hop_length, config
+
+    f0up_key = sys.argv[1]
+    input_path = sys.argv[2]
+    index_path = sys.argv[3]
+    f0method = sys.argv[4]
+    opt_path = sys.argv[5]
+    model_path = sys.argv[6]
+    index_rate = float(sys.argv[7])
+    device = sys.argv[8]
+    is_half = sys.argv[9].lower() != "false"
+    filter_radius = int(sys.argv[10])
+    resample_sr = int(sys.argv[11])
+    rms_mix_rate = float(sys.argv[12])
+    protect = float(sys.argv[13])
+    crepe_hop_length = int(sys.argv[14]) if len(sys.argv) > 14 else 128
+
+    config = Config(device, is_half)
+    device = config.device  # honour CPU/MPS fallback from device_config
+
+    setup_formant_db()
+    get_vc(model_path)
+    os.makedirs(opt_path, exist_ok=True)
+
+    files = [f for f in os.listdir(input_path) if f.lower().endswith(".wav")]
+    print("RVC_TOTAL\t%d" % len(files), flush=True)
+    for file in files:
+        print("RVC_START\t%s" % file, flush=True)
+        file_path = os.path.join(input_path, file)
+        try:
+            wav_opt = vc_single(0, file_path, f0up_key, None, f0method, index_path, index_rate)
+        except Exception as e:
+            print("RVC_FAIL\t%s" % file, flush=True)
+            print("  error converting %s: %r" % (file, e), flush=True)
+            continue
+        if wav_opt is not None:
+            wavfile.write(os.path.join(opt_path, file), tgt_sr, wav_opt)
+            print("RVC_DONE\t%s" % file, flush=True)
+        else:
+            print("RVC_FAIL\t%s" % file, flush=True)
+
+
+if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
+    main()

@@ -380,9 +380,14 @@ def run_rvc(
     log: LogFn = print,
     register: Optional[Callable[[subprocess.Popen], None]] = None,
     unregister: Optional[Callable[[subprocess.Popen], None]] = None,
+    on_file: Optional[Callable[[str, str], None]] = None,
 ) -> bool:
     """Run Mangio-RVC batch inference over every .wav in ``input_dir``, writing
-    converted wavs of the same name into ``output_dir``. Returns True on success."""
+    converted wavs of the same name into ``output_dir``. Returns True on success.
+
+    ``on_file(kind, filename)`` is called as the runner reports progress, with
+    ``kind`` one of ``"start"``, ``"done"``, ``"fail"`` — letting the caller update
+    per-file UI in real time instead of waiting for the whole batch."""
     rvc_dir = Path(rvc_dir)
     meta = VOICE_MODELS[voice]
     py = rvc_dir / "runtime" / "python.exe"
@@ -430,16 +435,24 @@ def run_rvc(
 
     if register:
         register(proc)
+    markers = {"RVC_START": "start", "RVC_DONE": "done", "RVC_FAIL": "fail"}
     tail: List[str] = []
     try:
         assert proc.stdout is not None
         for line in proc.stdout:
             line = line.rstrip()
-            if line:
-                logger.debug("rvc: %s", line)
-                tail.append(line)
-                if len(tail) > 20:
-                    tail.pop(0)
+            if not line:
+                continue
+            logger.debug("rvc: %s", line)
+            tag, _, payload = line.partition("\t")
+            if tag in markers and on_file:
+                on_file(markers[tag], payload)
+                continue
+            if tag == "RVC_TOTAL":
+                continue
+            tail.append(line)
+            if len(tail) > 20:
+                tail.pop(0)
         proc.wait()
     finally:
         if unregister:

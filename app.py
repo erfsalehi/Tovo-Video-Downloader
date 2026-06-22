@@ -1260,22 +1260,58 @@ class AppleStyleApp:
                 self._vo_status(index, "Failed (Silence)", "#FF3B30")
 
         # --- Stage 2: RVC conversion, one batch per voice ---
+        if device == "cpu":
+            self.log("-> Note: running on CPU — voice conversion is slow "
+                     "(~1–2 min/clip). Progress updates per file below.")
         for voice, items in prepared.items():
             if not items or self._is_cancelled():
                 continue
             in_dir = temp_root / voice / "in"
             out_dir = temp_root / voice / "out"
-            for idx, _title, _wav in items:
-                self._vo_status(idx, "Converting voice…", self.accent_color)
+            total = len(items)
+            # Map the prepared wav filename back to its (manager index, title).
+            by_file = {f"{title}.wav": (idx, title) for idx, title, _wav in items}
+            moved: set = set()
+            done_count = [0]
+
+            def on_file(kind: str, fname: str) -> None:
+                info = by_file.get(fname)
+                if not info:
+                    return
+                idx, title = info
+                if kind == "start":
+                    self._vo_status(idx, f"Converting voice… ({done_count[0] + 1}/{total})",
+                                    self.accent_color)
+                elif kind == "done":
+                    src = out_dir / fname
+                    if src.exists():
+                        try:
+                            shutil.move(str(src), str(dub_dir / fname))
+                            self._vo_status(idx, "Finished", "#34C759")
+                            moved.add(idx)
+                        except OSError as e:
+                            self.log(f"[!] Could not move {fname} to Dub folder: {e}")
+                            self._vo_status(idx, "Failed (Save)", "#FF3B30")
+                    else:
+                        self._vo_status(idx, "Failed (RVC)", "#FF3B30")
+                    done_count[0] += 1
+                elif kind == "fail":
+                    self._vo_status(idx, "Failed (RVC)", "#FF3B30")
+                    done_count[0] += 1
 
             ok = voiceover.run_rvc(
                 rvc_dir, voice, self._vo_rvc_settings(voice), device, is_half,
                 str(in_dir), str(out_dir), log=self.log,
                 register=lambda p: self._add_active_process(90000, p),
                 unregister=lambda p: self._remove_active_process(90000),
+                on_file=on_file,
             )
 
+            # Fallback for any items the per-file callback didn't resolve (e.g. an
+            # older runner without progress markers, or an early exit).
             for idx, title, _wav in items:
+                if idx in moved:
+                    continue
                 src = out_dir / f"{title}.wav"
                 if ok and src.exists():
                     try:
@@ -1284,7 +1320,7 @@ class AppleStyleApp:
                     except OSError as e:
                         self.log(f"[!] Could not move {title}.wav to Dub folder: {e}")
                         self._vo_status(idx, "Failed (Save)", "#FF3B30")
-                else:
+                elif not self._is_cancelled():
                     self._vo_status(idx, "Failed (RVC)", "#FF3B30")
 
         try:
