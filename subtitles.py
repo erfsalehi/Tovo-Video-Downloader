@@ -530,6 +530,34 @@ class WhisperAligner:
 
         return list(zip(starts, ends))
 
+    def transcribe_segments(
+        self,
+        audio_source: str,
+        is_cancelled: CancelFn = lambda: False,
+        language: Optional[str] = None,
+        progress_callback: Optional[ProgressFn] = None,
+    ) -> List[Tuple[float, float, str]]:
+        """Transcribe and return ``(start, end, text)`` per segment — the timed
+        transcript used to pick highlight clips and to burn per-clip captions."""
+        if is_cancelled():
+            return []
+        model = self._ensure_model()
+        if is_cancelled():
+            return []
+        self.log("-> Transcribing audio (timed transcript)...")
+        kwargs = {}
+        if language:
+            kwargs["language"] = language
+        if progress_callback is not None:
+            kwargs["progress_callback"] = progress_callback
+        result = model.transcribe(audio_source, **kwargs)
+        out: List[Tuple[float, float, str]] = []
+        for s in result.segments:
+            text = (s.text or "").strip()
+            if text and s.end > s.start:
+                out.append((float(s.start), float(s.end), text))
+        return out
+
     def transcribe_to_srt(
         self,
         audio_source: str,

@@ -27,6 +27,7 @@ from subtitles import (
 )
 from widgets import DownloadManager, RoundedButton, RoundedEntry, ModernCheckbutton, RoundedFrame
 import voiceover
+import shortclips
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +112,8 @@ class AppleStyleApp:
         self.vo_sources: List[str] = list(self.config.get("vo_sources", []) or [])
         if not self.vo_sources and self.vo_source_dir:
             self.vo_sources = [self.vo_source_dir]
+        self.caption_dir = self.config.get("caption_dir", "")
+        self.shorts_video = ""  # selected per session; UI build reads this
         # Locate the Mangio-RVC folder (auto-detect if the saved path is missing,
         # e.g. on a different machine) so the Voiceover tab works everywhere.
         self.rvc_dir = self.config.get("rvc_dir", "")
@@ -155,6 +158,11 @@ class AppleStyleApp:
         self.caption_dir = self.config.get("caption_dir", "")
         self.caption_manager: Optional[DownloadManager] = None
         self._caption_items: List[Path] = []
+
+        # Short Clips tab state
+        self.shorts_video = ""
+        self._shorts_clips: List[dict] = []                 # highlight suggestions
+        self._shorts_segments: List[Tuple[float, float, str]] = []  # cached transcript
 
         self.root.after(500, self.check_dependencies)
 
@@ -228,7 +236,15 @@ class AppleStyleApp:
             text_color="#86868B", font=(self.font_family, 11, "bold"),
             width=120, height=44
         )
-        self.btn_cap_tab.pack(side=tk.LEFT)
+        self.btn_cap_tab.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.btn_shorts_tab = RoundedButton(
+            tab_frame, text="Shorts", command=lambda: self._switch_tab("shorts"),
+            radius=20, bg_color=self.bg_color, hover_color=self.gray_hover,
+            text_color="#86868B", font=(self.font_family, 11, "bold"),
+            width=120, height=44
+        )
+        self.btn_shorts_tab.pack(side=tk.LEFT)
 
         # Tab Content Area
         self.content_frame = tk.Frame(container, bg=self.bg_color)
@@ -261,6 +277,11 @@ class AppleStyleApp:
         self.cap_tab.grid(row=0, column=0, sticky="nsew")
         self._build_caption_tab(self.cap_tab)
 
+        # Tab 6: Short Clips
+        self.shorts_tab = tk.Frame(self.content_frame, bg=self.bg_color)
+        self.shorts_tab.grid(row=0, column=0, sticky="nsew")
+        self._build_shorts_tab(self.shorts_tab)
+
         # Initial State
         self._switch_tab("dl")
 
@@ -274,6 +295,7 @@ class AppleStyleApp:
             "sync": (self.sync_tab, self.btn_sync_tab),
             "vo": (self.vo_tab, self.btn_vo_tab),
             "cap": (self.cap_tab, self.btn_cap_tab),
+            "shorts": (self.shorts_tab, self.btn_shorts_tab),
         }
         if tab not in tabs:
             return
@@ -1614,6 +1636,249 @@ class AppleStyleApp:
             self.root.after(0, lambda: self.cap_btn.config_state(
                 "normal", text="Finish & Return", bg="#34C759"))
 
+    # ------------------------------------------------------------------
+    # Short Clips tab
+    # ------------------------------------------------------------------
+    def _build_shorts_tab(self, parent: tk.Frame) -> None:
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(3, weight=1, minsize=140)
+
+        tk.Label(parent, text="Short Clips", bg=self.bg_color, fg=self.text_color,
+                 font=(self.font_family, 22, "bold")).grid(
+            row=0, column=0, sticky="w", pady=(20, 2), padx=10)
+        tk.Label(
+            parent,
+            text="Find the most interesting moments in a long video (from its voice only) "
+                 "and render them as vertical 9:16 shorts with burned-in captions.",
+            bg=self.bg_color, fg="#86868B", font=(self.font_family, 10),
+            justify="left", wraplength=760,
+        ).grid(row=1, column=0, sticky="w", pady=(0, 8), padx=10)
+
+        card = tk.Frame(parent, bg=self.bg_color)
+        card.grid(row=2, column=0, sticky="ew", padx=10)
+        card.grid_columnconfigure(0, weight=1)
+
+        # Video picker
+        vid = tk.Frame(card, bg=self.bg_color)
+        vid.pack(fill="x", pady=(0, 6))
+        vid.grid_columnconfigure(1, weight=1)
+        tk.Label(vid, text="Video:", bg=self.bg_color, fg=self.text_color,
+                 font=(self.font_family, 10, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.shorts_video_label = tk.Label(vid, text=self.shorts_video or "Not Selected",
+                                           bg=self.bg_color, fg="#5E5CE6",
+                                           font=(self.font_family, 10), anchor="w")
+        self.shorts_video_label.grid(row=0, column=1, sticky="ew")
+        RoundedButton(vid, text="Browse…", command=self.browse_shorts_video, radius=14,
+                      bg_color=self.gray_bg, hover_color=self.gray_hover, text_color=self.text_color,
+                      font=(self.font_family, 10, "bold"), width=90, height=32).grid(
+            row=0, column=2, sticky="e", padx=(6, 0))
+
+        # OpenRouter key + model
+        orr = tk.Frame(card, bg=self.bg_color)
+        orr.pack(fill="x", pady=(0, 6))
+        orr.grid_columnconfigure(1, weight=1)
+        tk.Label(orr, text="OpenRouter Key:", bg=self.bg_color, fg=self.text_color,
+                 font=(self.font_family, 10, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.openrouter_key_var = tk.StringVar(value=self.config.get("openrouter_api_key", ""))
+        self.openrouter_key_entry = RoundedEntry(orr, variable=self.openrouter_key_var, show="*",
+                                                 radius=12, bg_color="white")
+        self.openrouter_key_entry.grid(row=0, column=1, sticky="ew")
+        self.openrouter_key_entry.entry.bind("<FocusOut>", lambda e: self._save_config())
+        tk.Label(orr, text="Model:", bg=self.bg_color, fg=self.text_color,
+                 font=(self.font_family, 10, "bold")).grid(row=0, column=2, sticky="w", padx=(10, 8))
+        self.shorts_model_var = tk.StringVar(value=self.config.get("shorts_model", "deepseek/deepseek-chat"))
+        model_entry = RoundedEntry(orr, variable=self.shorts_model_var, radius=12,
+                                   bg_color="white", width=200)
+        model_entry.grid(row=0, column=3, sticky="e")
+        model_entry.entry.bind("<FocusOut>", lambda e: self._save_config())
+
+        # Params
+        par = tk.Frame(card, bg=self.bg_color)
+        par.pack(fill="x", pady=(0, 8))
+        tk.Label(par, text="Clips:", bg=self.bg_color, fg=self.text_color,
+                 font=(self.font_family, 10, "bold")).pack(side=tk.LEFT, padx=(0, 4))
+        self.shorts_num_var = tk.IntVar(value=self.config.get("shorts_num_clips", 5))
+        tk.Spinbox(par, from_=1, to=20, width=4, textvariable=self.shorts_num_var,
+                   font=(self.font_family, 10), command=self._save_config).pack(side=tk.LEFT)
+        tk.Label(par, text="Length:", bg=self.bg_color, fg=self.text_color,
+                 font=(self.font_family, 10, "bold")).pack(side=tk.LEFT, padx=(14, 4))
+        self.shorts_min_var = tk.IntVar(value=self.config.get("shorts_min_dur", 20))
+        tk.Spinbox(par, from_=5, to=120, width=4, textvariable=self.shorts_min_var,
+                   font=(self.font_family, 10), command=self._save_config).pack(side=tk.LEFT)
+        tk.Label(par, text="–", bg=self.bg_color, fg=self.text_color).pack(side=tk.LEFT, padx=2)
+        self.shorts_max_var = tk.IntVar(value=self.config.get("shorts_max_dur", 60))
+        tk.Spinbox(par, from_=10, to=180, width=4, textvariable=self.shorts_max_var,
+                   font=(self.font_family, 10), command=self._save_config).pack(side=tk.LEFT)
+        tk.Label(par, text="s", bg=self.bg_color, fg=self.text_color).pack(side=tk.LEFT, padx=(2, 0))
+        tk.Label(par, text="Whisper:", bg=self.bg_color, fg=self.text_color,
+                 font=(self.font_family, 10, "bold")).pack(side=tk.LEFT, padx=(14, 4))
+        self.shorts_wmodel_var = tk.StringVar(value=self.config.get("shorts_caption_model", "small"))
+        ttk.Combobox(par, textvariable=self.shorts_wmodel_var, state="readonly", width=9,
+                     values=["base", "small", "medium", "large-v3"],
+                     font=(self.font_family, 10)).pack(side=tk.LEFT)
+        self.shorts_burn_var = tk.BooleanVar(value=self.config.get("shorts_burn_captions", True))
+        ModernCheckbutton(par, text="Burn captions", variable=self.shorts_burn_var,
+                          bg_color=self.bg_color, command=self._save_config).pack(side=tk.LEFT, padx=(14, 0))
+        for v in (self.shorts_num_var, self.shorts_min_var, self.shorts_max_var, self.shorts_wmodel_var):
+            v.trace_add("write", lambda *_: self._save_config())
+
+        # Suggestions list
+        border = tk.Frame(parent, bg="#D2D2D7")
+        border.grid(row=3, column=0, sticky="nsew", padx=10, pady=(4, 8))
+        border.grid_columnconfigure(0, weight=1)
+        border.grid_rowconfigure(0, weight=1)
+        self.shorts_listbox = tk.Listbox(
+            border, selectmode=tk.EXTENDED, activestyle="none",
+            font=(self.font_family, 10), bg="white", fg=self.text_color,
+            selectbackground=self.accent_color, selectforeground="white",
+            relief=tk.FLAT, bd=0, highlightthickness=0,
+        )
+        self.shorts_listbox.grid(row=0, column=0, sticky="nsew", padx=1, pady=1)
+        s_scroll = tk.Scrollbar(border, command=self.shorts_listbox.yview)
+        s_scroll.grid(row=0, column=1, sticky="ns")
+        self.shorts_listbox.config(yscrollcommand=s_scroll.set)
+
+        # Buttons
+        brow = tk.Frame(parent, bg=self.bg_color)
+        brow.grid(row=4, column=0, sticky="ew", pady=(0, 16), padx=10)
+        brow.grid_columnconfigure(0, weight=2)
+        brow.grid_columnconfigure(1, weight=2)
+        brow.grid_columnconfigure(2, weight=1)
+        self.shorts_analyze_btn = RoundedButton(
+            brow, text="🔎  Analyze", command=self.start_shorts_analyze,
+            radius=22, bg_color=self.accent_color, hover_color=self.accent_hover,
+            text_color="white", font=(self.font_family, 12, "bold"), height=46)
+        self.shorts_analyze_btn.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.shorts_render_btn = RoundedButton(
+            brow, text="🎬  Render Selected", command=self.start_shorts_render,
+            radius=22, bg_color="#34C759", hover_color="#2BA149",
+            text_color="white", font=(self.font_family, 12, "bold"), height=46)
+        self.shorts_render_btn.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        self.shorts_cancel_btn = RoundedButton(
+            brow, text="Cancel", command=self.cancel_download,
+            radius=22, bg_color="#FF3B30", hover_color="#D70A01",
+            text_color="white", font=(self.font_family, 12, "bold"), height=46)
+        self.shorts_cancel_btn.grid(row=0, column=2, sticky="ew")
+        self.shorts_cancel_btn.config_state("disabled", bg="#E5E5EA")
+
+    def browse_shorts_video(self) -> None:
+        sel = filedialog.askopenfilename(
+            initialdir=self.config.get("shorts_dir", "") or os.path.expanduser("~"),
+            title="Select Long Video",
+            filetypes=[("Video", "*.mp4 *.mkv *.mov *.avi *.webm"), ("All files", "*.*")],
+        )
+        if sel:
+            self.shorts_video = os.path.normpath(sel)
+            self.shorts_video_label.config(text=self.shorts_video)
+            self.config.set("shorts_dir", str(Path(self.shorts_video).parent))
+            self._save_config()
+
+    def _shorts_set_busy(self, busy: bool) -> None:
+        with self._state_lock:
+            self.downloading = busy
+            if not busy:
+                self.cancelled = False
+        self.shorts_analyze_btn.config_state(
+            "disabled" if busy else "normal", bg="#E5E5EA" if busy else self.accent_color)
+        self.shorts_render_btn.config_state(
+            "disabled" if busy else "normal", bg="#E5E5EA" if busy else "#34C759")
+        self.shorts_cancel_btn.config_state(
+            "normal" if busy else "disabled", bg="#FF3B30" if busy else "#E5E5EA")
+
+    def start_shorts_analyze(self) -> None:
+        if self.downloading:
+            return
+        if not self.shorts_video or not Path(self.shorts_video).is_file():
+            self.log("[!] Shorts: pick a video first.")
+            return
+        if not self.openrouter_key_var.get().strip():
+            self.log("[!] Shorts: enter your OpenRouter API key first.")
+            return
+        self._save_config()
+        self._shorts_set_busy(True)
+        threading.Thread(target=self._shorts_analyze_worker,
+                         args=(self.shorts_video,), daemon=True).start()
+
+    def _shorts_analyze_worker(self, video: str) -> None:
+        self.log("\n--- Analyzing video for short clips ---")
+        aligner = WhisperAligner.try_create(self.log, model_name=self.shorts_wmodel_var.get())
+        if aligner is None:
+            self.log("[!] Shorts: local Whisper unavailable (install Whisper deps).")
+            self.root.after(0, self.reset_ui)
+            return
+        segs = aligner.transcribe_segments(str(video), is_cancelled=self._is_cancelled)
+        if self._is_cancelled():
+            self.root.after(0, self.reset_ui)
+            return
+        if not segs:
+            self.log("[!] Shorts: no speech found in the video.")
+            self.root.after(0, lambda: self._shorts_set_busy(False))
+            return
+        self._shorts_segments = segs
+        try:
+            num = int(self.shorts_num_var.get())
+            mn = float(self.shorts_min_var.get())
+            mx = float(self.shorts_max_var.get())
+        except (ValueError, tk.TclError):
+            num, mn, mx = 5, 20.0, 60.0
+        clips = shortclips.find_highlights(
+            self.openrouter_key_var.get().strip(), self.shorts_model_var.get().strip(),
+            segs, num, mn, mx, log=self.log,
+            proxy=self.proxy_url_var.get().strip(), trust_env=True,
+        )
+        self._shorts_clips = clips
+        self.root.after(0, self._populate_shorts_list)
+        self.root.after(0, lambda: self._shorts_set_busy(False))
+
+    def _populate_shorts_list(self) -> None:
+        self.shorts_listbox.delete(0, tk.END)
+        for i, c in enumerate(self._shorts_clips, 1):
+            reason = f"  —  {c['reason']}" if c.get("reason") else ""
+            self.shorts_listbox.insert(
+                tk.END, f"{i}. [{c['start']:.0f}–{c['end']:.0f}s]  {c['title']}{reason}")
+        if self._shorts_clips:
+            self.log(f"-> {len(self._shorts_clips)} suggestion(s). Select rows to render "
+                     "(or select none = render all), then click Render Selected.")
+
+    def start_shorts_render(self) -> None:
+        if self.downloading:
+            return
+        if not self._shorts_clips:
+            self.log("[!] Shorts: analyze a video first.")
+            return
+        sel = list(self.shorts_listbox.curselection())
+        clips = [self._shorts_clips[i] for i in sel] if sel else list(self._shorts_clips)
+        self._shorts_set_busy(True)
+        threading.Thread(target=self._shorts_render_worker, args=(clips,), daemon=True).start()
+
+    def _shorts_render_worker(self, clips: List[dict]) -> None:
+        self.log(f"\n--- Rendering {len(clips)} short(s) ---")
+        ff = str(BASE_PATH / "ffmpeg.exe")
+        video = self.shorts_video
+        outdir = Path(video).parent / "Shorts"
+        outdir.mkdir(parents=True, exist_ok=True)
+        burn = self.shorts_burn_var.get()
+        segs = self._shorts_segments if burn else None
+        done = 0
+        for i, c in enumerate(clips, 1):
+            if self._is_cancelled():
+                break
+            out = outdir / f"{i:02d} - {shortclips.safe_name(c['title'])}.mp4"
+            ok = shortclips.render_short(
+                ff, video, c["start"], c["end"], out, segments=segs, burn_captions=burn,
+                log=self.log,
+                register=lambda p: self._add_active_process(95000, p),
+                unregister=lambda p: self._remove_active_process(95000),
+            )
+            if ok:
+                done += 1
+        if self._is_cancelled():
+            self.log("\nShorts rendering cancelled by user.")
+            self.root.after(0, self.reset_ui)
+        else:
+            self.log(f"\n--- Done: {done}/{len(clips)} short(s) saved to {outdir} ---")
+            self.root.after(0, lambda: self._shorts_set_busy(False))
+
     def _build_advanced_row(self, parent: tk.Frame, row: int) -> None:
         frame = tk.Frame(parent, bg=self.bg_color)
         frame.grid(row=row, column=0, sticky="ew", pady=(0, 6), padx=10)
@@ -1813,6 +2078,17 @@ class AppleStyleApp:
             self.config.set("caption_language", self.caption_lang_var.get())
             self.config.set("caption_fill_gaps", self.caption_fill_gaps_var.get())
             self.config.set("caption_overwrite", self.cap_overwrite_var.get())
+        if hasattr(self, "openrouter_key_var"):
+            self.config.set("openrouter_api_key", self.openrouter_key_var.get().strip())
+            self.config.set("shorts_model", self.shorts_model_var.get().strip())
+            self.config.set("shorts_caption_model", self.shorts_wmodel_var.get())
+            self.config.set("shorts_burn_captions", self.shorts_burn_var.get())
+            try:
+                self.config.set("shorts_num_clips", int(self.shorts_num_var.get()))
+                self.config.set("shorts_min_dur", int(self.shorts_min_var.get()))
+                self.config.set("shorts_max_dur", int(self.shorts_max_var.get()))
+            except (ValueError, tk.TclError):
+                pass
         self._save_voiceover_config()
         self.config.save()
 
@@ -3379,6 +3655,12 @@ class AppleStyleApp:
         if hasattr(self, "caption_manager") and self.caption_manager:
             self.caption_manager.destroy()
             self.caption_manager = None
+
+        # Reset Short Clips tab (no manager/frame hide; just re-enable buttons)
+        if hasattr(self, "shorts_analyze_btn"):
+            self.shorts_analyze_btn.config_state("normal", bg=self.accent_color)
+            self.shorts_render_btn.config_state("normal", bg="#34C759")
+            self.shorts_cancel_btn.config_state("disabled", text="Cancel", bg="#E5E5EA")
             
         self.dl_input_text.config(state="normal", bg="white")
         self.trans_input_text.config(state="normal", bg="white")

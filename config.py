@@ -31,6 +31,15 @@ DEFAULTS: dict[str, Any] = {
     "caption_language": "Auto",
     "caption_fill_gaps": True,
     "caption_overwrite": False,
+    # --- Short Clips tab ---
+    "openrouter_api_key": "",
+    "shorts_model": "deepseek/deepseek-chat",
+    "shorts_num_clips": 5,
+    "shorts_min_dur": 20,
+    "shorts_max_dur": 60,
+    "shorts_caption_model": "small",
+    "shorts_burn_captions": True,
+    "shorts_dir": "",
     # --- Voiceover (dubbing) tab ---
     "vo_source_dir": "",
     "vo_sources": [],
