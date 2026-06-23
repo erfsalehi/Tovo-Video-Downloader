@@ -151,6 +151,11 @@ class AppleStyleApp:
         self.vo_manager: Optional[DownloadManager] = None
         self._vo_candidates: List[Dict] = []  # clip specs (folder files + zip members)
 
+        # Auto-Caption tab state
+        self.caption_dir = self.config.get("caption_dir", "")
+        self.caption_manager: Optional[DownloadManager] = None
+        self._caption_items: List[Path] = []
+
         self.root.after(500, self.check_dependencies)
 
     def _usable_screen_rect(self) -> Tuple[int, int, int, int]:
@@ -189,7 +194,7 @@ class AppleStyleApp:
             tab_frame, text="Downloads", command=lambda: self._switch_tab("dl"),
             radius=20, bg_color="white", hover_color=self.gray_hover,
             text_color=self.accent_color, font=(self.font_family, 11, "bold"),
-            width=150, height=45
+            width=120, height=44
         )
         self.btn_dl_tab.pack(side=tk.LEFT, padx=(0, 10))
         
@@ -197,7 +202,7 @@ class AppleStyleApp:
             tab_frame, text="Transcription", command=lambda: self._switch_tab("trans"),
             radius=20, bg_color=self.bg_color, hover_color=self.gray_hover,
             text_color="#86868B", font=(self.font_family, 11, "bold"),
-            width=150, height=45
+            width=120, height=44
         )
         self.btn_trans_tab.pack(side=tk.LEFT, padx=(0, 10))
 
@@ -205,7 +210,7 @@ class AppleStyleApp:
             tab_frame, text="Sync SRT", command=lambda: self._switch_tab("sync"),
             radius=20, bg_color=self.bg_color, hover_color=self.gray_hover,
             text_color="#86868B", font=(self.font_family, 11, "bold"),
-            width=150, height=45
+            width=120, height=44
         )
         self.btn_sync_tab.pack(side=tk.LEFT, padx=(0, 10))
 
@@ -213,9 +218,17 @@ class AppleStyleApp:
             tab_frame, text="Voiceover", command=lambda: self._switch_tab("vo"),
             radius=20, bg_color=self.bg_color, hover_color=self.gray_hover,
             text_color="#86868B", font=(self.font_family, 11, "bold"),
-            width=150, height=45
+            width=120, height=44
         )
-        self.btn_vo_tab.pack(side=tk.LEFT)
+        self.btn_vo_tab.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.btn_cap_tab = RoundedButton(
+            tab_frame, text="Captions", command=lambda: self._switch_tab("cap"),
+            radius=20, bg_color=self.bg_color, hover_color=self.gray_hover,
+            text_color="#86868B", font=(self.font_family, 11, "bold"),
+            width=120, height=44
+        )
+        self.btn_cap_tab.pack(side=tk.LEFT)
 
         # Tab Content Area
         self.content_frame = tk.Frame(container, bg=self.bg_color)
@@ -243,6 +256,11 @@ class AppleStyleApp:
         self.vo_tab.grid(row=0, column=0, sticky="nsew")
         self._build_vo_tab(self.vo_tab)
 
+        # Tab 5: Auto-Caption
+        self.cap_tab = tk.Frame(self.content_frame, bg=self.bg_color)
+        self.cap_tab.grid(row=0, column=0, sticky="nsew")
+        self._build_caption_tab(self.cap_tab)
+
         # Initial State
         self._switch_tab("dl")
 
@@ -255,6 +273,7 @@ class AppleStyleApp:
             "trans": (self.trans_tab, self.btn_trans_tab),
             "sync": (self.sync_tab, self.btn_sync_tab),
             "vo": (self.vo_tab, self.btn_vo_tab),
+            "cap": (self.cap_tab, self.btn_cap_tab),
         }
         if tab not in tabs:
             return
@@ -269,6 +288,8 @@ class AppleStyleApp:
         # Refresh the sync list each time the tab is opened (unless a job runs).
         if tab == "sync" and not self.downloading:
             self._scan_sync_items()
+        if tab == "cap" and not self.downloading:
+            self._scan_caption_items()
 
     def _build_dl_tab(self, parent: tk.Frame) -> None:
         parent.grid_columnconfigure(0, weight=1)
@@ -1373,6 +1394,226 @@ class AppleStyleApp:
         self.vo_cancel_btn.command = lambda: self._open_folder(Path(self.dub_dir))
         self.vo_cancel_btn.config_state("normal", text="📂  Open Dub Folder", bg=self.accent_color)
 
+    # ------------------------------------------------------------------
+    # Auto-Caption tab
+    # ------------------------------------------------------------------
+    CAPTION_MEDIA_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4a",
+                          ".mp3", ".wav", ".ogg", ".flac", ".aac")
+
+    def _build_caption_tab(self, parent: tk.Frame) -> None:
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(2, weight=1, minsize=160)
+
+        tk.Label(parent, text="Auto Caption", bg=self.bg_color, fg=self.text_color,
+                 font=(self.font_family, 22, "bold")).grid(
+            row=0, column=0, sticky="w", pady=(20, 2), padx=10)
+        tk.Label(
+            parent,
+            text="Transcribe audio/video and write a fresh .srt next to each file — "
+                 "for dubs (or any media) that don't have a subtitle yet. Offline (local Whisper).",
+            bg=self.bg_color, fg="#86868B", font=(self.font_family, 10),
+            justify="left", wraplength=760,
+        ).grid(row=1, column=0, sticky="w", pady=(0, 8), padx=10)
+
+        # Selection area (hidden while a job runs, replaced by the progress manager).
+        self.cap_select_frame = tk.Frame(parent, bg=self.bg_color)
+        self.cap_select_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 12), padx=10)
+        self.cap_select_frame.grid_columnconfigure(0, weight=1)
+        self.cap_select_frame.grid_rowconfigure(1, weight=1)
+
+        controls = tk.Frame(self.cap_select_frame, bg=self.bg_color)
+        controls.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        controls.grid_columnconfigure(3, weight=1)
+        RoundedButton(
+            controls, text="Folder…", command=self.browse_caption_dir, radius=14,
+            bg_color=self.gray_bg, hover_color=self.gray_hover, text_color=self.text_color,
+            font=(self.font_family, 10, "bold"), width=90, height=32,
+        ).grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.cap_scan_btn = RoundedButton(
+            controls, text="↻ Rescan", command=self._scan_caption_items, radius=14,
+            bg_color=self.gray_bg, hover_color=self.gray_hover, text_color=self.text_color,
+            font=(self.font_family, 10, "bold"), width=100, height=32,
+        )
+        self.cap_scan_btn.grid(row=0, column=1, sticky="w", padx=(0, 6))
+        self.cap_overwrite_var = tk.BooleanVar(value=self.config.get("caption_overwrite", False))
+        ModernCheckbutton(
+            controls, text="Re-caption files that already have .srt",
+            variable=self.cap_overwrite_var, bg_color=self.bg_color,
+            command=lambda: (self._save_config(), self._scan_caption_items()),
+        ).grid(row=0, column=2, sticky="w", padx=(6, 0))
+        self.cap_count_label = tk.Label(controls, text="", bg=self.bg_color, fg="#86868B",
+                                        font=(self.font_family, 10), anchor="e")
+        self.cap_count_label.grid(row=0, column=3, sticky="e")
+
+        border = tk.Frame(self.cap_select_frame, bg="#D2D2D7")
+        border.grid(row=1, column=0, sticky="nsew")
+        border.grid_columnconfigure(0, weight=1)
+        border.grid_rowconfigure(0, weight=1)
+        self.cap_listbox = tk.Listbox(
+            border, selectmode=tk.EXTENDED, activestyle="none",
+            font=(self.font_family, 10), bg="white", fg=self.text_color,
+            selectbackground=self.accent_color, selectforeground="white",
+            relief=tk.FLAT, bd=0, highlightthickness=0,
+        )
+        self.cap_listbox.grid(row=0, column=0, sticky="nsew", padx=1, pady=1)
+        cap_scroll = tk.Scrollbar(border, command=self.cap_listbox.yview)
+        cap_scroll.grid(row=0, column=1, sticky="ns")
+        self.cap_listbox.config(yscrollcommand=cap_scroll.set)
+
+        opts = tk.Frame(self.cap_select_frame, bg=self.bg_color)
+        opts.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        tk.Label(opts, text="Model:", bg=self.bg_color, fg=self.text_color,
+                 font=(self.font_family, 10, "bold")).pack(side=tk.LEFT, padx=(0, 6))
+        self.caption_model_var = tk.StringVar(value=self.config.get("caption_model", "small"))
+        ttk.Combobox(opts, textvariable=self.caption_model_var, state="readonly", width=10,
+                     values=["base", "small", "medium", "large-v3"],
+                     font=(self.font_family, 10)).pack(side=tk.LEFT)
+        tk.Label(opts, text="Language:", bg=self.bg_color, fg=self.text_color,
+                 font=(self.font_family, 10, "bold")).pack(side=tk.LEFT, padx=(16, 6))
+        self.caption_lang_var = tk.StringVar(value=self.config.get("caption_language", "Auto"))
+        ttk.Combobox(opts, textvariable=self.caption_lang_var, state="readonly", width=8,
+                     values=["Auto", "fa", "en", "ar", "tr"],
+                     font=(self.font_family, 10)).pack(side=tk.LEFT)
+        self.caption_fill_gaps_var = tk.BooleanVar(value=self.config.get("caption_fill_gaps", True))
+        ModernCheckbutton(opts, text="Fill silence (line stays until next)",
+                          variable=self.caption_fill_gaps_var, bg_color=self.bg_color,
+                          command=self._save_config).pack(side=tk.LEFT, padx=(16, 0))
+        for v in (self.caption_model_var, self.caption_lang_var):
+            v.trace_add("write", lambda *_: self._save_config())
+
+        self._build_caption_button_row(parent, row=3)
+
+    def _build_caption_button_row(self, parent: tk.Frame, row: int) -> None:
+        frame = tk.Frame(parent, bg=self.bg_color)
+        frame.grid(row=row, column=0, sticky="ew", pady=(8, 16), padx=10)
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_columnconfigure(1, weight=1)
+        self.cap_btn = RoundedButton(
+            frame, text="💬  Generate Captions", command=self.start_captions,
+            radius=22, bg_color=self.accent_color, hover_color=self.accent_hover,
+            text_color="white", font=(self.font_family, 12, "bold"), height=46,
+        )
+        self.cap_btn.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.cap_cancel_btn = RoundedButton(
+            frame, text="Cancel", command=self.cancel_download,
+            radius=22, bg_color="#FF3B30", hover_color="#D70A01",
+            text_color="white", font=(self.font_family, 12, "bold"), height=46,
+        )
+        self.cap_cancel_btn.grid(row=0, column=1, sticky="ew")
+        self.cap_cancel_btn.config_state("disabled", bg="#E5E5EA")
+
+    def browse_caption_dir(self) -> None:
+        initial = self.caption_dir or self.dub_dir or os.path.expanduser("~")
+        selected = filedialog.askdirectory(initialdir=initial,
+                                           title="Select Folder to Caption")
+        if selected:
+            self.caption_dir = os.path.normpath(selected)
+            self._save_config()
+            self._scan_caption_items()
+
+    def _scan_caption_items(self) -> None:
+        if self.downloading:
+            return
+        self.cap_listbox.delete(0, tk.END)
+        self._caption_items = []
+        folder = Path(self.caption_dir) if self.caption_dir else None
+        if not folder or not folder.is_dir():
+            self.cap_count_label.config(text="No folder selected")
+            return
+        overwrite = self.cap_overwrite_var.get()
+        for entry in sorted(folder.iterdir(), key=lambda p: p.name.lower()):
+            if not entry.is_file() or entry.suffix.lower() not in self.CAPTION_MEDIA_EXTS:
+                continue
+            if not overwrite and entry.with_suffix(".srt").exists():
+                continue  # already has a subtitle
+            self._caption_items.append(entry)
+            self.cap_listbox.insert(tk.END, entry.name)
+        n = len(self._caption_items)
+        self.cap_count_label.config(
+            text=f"{n} file(s) to caption" if n else "Nothing to caption (all have .srt)")
+
+    def start_captions(self) -> None:
+        if self.downloading and self.cap_btn.text == "Finish & Return":
+            self.reset_ui()
+            return
+        if self.downloading:
+            return
+        if not self._caption_items:
+            self.log("[!] Captions: nothing to caption — pick a folder and Rescan.")
+            return
+
+        items = list(self._caption_items)
+        with self._state_lock:
+            self.downloading = True
+            self.cancelled = False
+        self.cancelled_indices = set()
+
+        self.cap_btn.config_state("disabled", text="Captioning...", bg="#E5E5EA")
+        self.cap_cancel_btn.config_state("normal", bg="#FF3B30")
+        self.cap_select_frame.grid_remove()
+
+        self.caption_manager = DownloadManager(
+            self.cap_tab, [p.name for p in items],
+            self._cap_skip_item, self._cap_skip_item, self._cap_skip_item,
+            None, self.bg_color, self.text_color, self.accent_color, self.font_family,
+        )
+        self.caption_manager.grid(row=2, column=0, sticky="nsew", pady=(0, 15))
+        threading.Thread(target=self._caption_worker, args=(items,), daemon=True).start()
+
+    def _cap_skip_item(self, index: int) -> None:
+        with self._state_lock:
+            self.cancelled_indices.add(index)
+            if self.caption_manager:
+                self.caption_manager.set_item_status(index, "Skipped", "#34C759")
+
+    def _cap_status(self, index: int, text: str, color: str) -> None:
+        if self.caption_manager:
+            self.root.after(0, self.caption_manager.set_item_status, index, text, color)
+
+    def _caption_worker(self, items: List[Path]) -> None:
+        self.log(f"\n--- Starting Auto-Caption ({len(items)} file(s)) ---")
+        aligner = WhisperAligner.try_create(self.log, model_name=self.caption_model_var.get())
+        if aligner is None:
+            self.log("[!] Captions: local Whisper is not available (install Whisper deps).")
+            self.root.after(0, self.reset_ui)
+            return
+
+        lang = self.caption_lang_var.get()
+        language = None if lang == "Auto" else lang
+        fill_gaps = self.caption_fill_gaps_var.get()
+
+        for index, media in enumerate(items):
+            if self._is_cancelled() or index in self.cancelled_indices:
+                continue
+            self._cap_status(index, "Transcribing…", self.accent_color)
+            out_srt = media.with_suffix(".srt")
+            try:
+                ok = aligner.transcribe_to_srt(
+                    str(media), out_srt, is_cancelled=self._is_cancelled,
+                    language=language, fill_gaps=fill_gaps,
+                )
+            except Exception as e:
+                logger.exception("Auto-caption failed for %s", media.name)
+                self.log(f"[!] Caption error for {media.name}: {e}")
+                self._cap_status(index, "Failed", "#FF3B30")
+                continue
+            if self._is_cancelled():
+                break
+            if ok:
+                self.log(f"-> Captioned: {media.name} → {out_srt.name}")
+                self._maybe_export_ttml(out_srt)
+                self._cap_status(index, "Finished", "#34C759")
+            else:
+                self._cap_status(index, "Failed (No speech)", "#FF3B30")
+
+        if self._is_cancelled():
+            self.log("\nAuto-caption cancelled by user.")
+            self.root.after(0, self.reset_ui)
+        else:
+            self.log("\n--- Auto-Caption Complete ---")
+            self.root.after(0, lambda: self.cap_btn.config_state(
+                "normal", text="Finish & Return", bg="#34C759"))
+
     def _build_advanced_row(self, parent: tk.Frame, row: int) -> None:
         frame = tk.Frame(parent, bg=self.bg_color)
         frame.grid(row=row, column=0, sticky="ew", pady=(0, 6), padx=10)
@@ -1566,6 +1807,12 @@ class AppleStyleApp:
             self.config.set("sync_fill_gaps", self.sync_fill_gaps_var.get())
         if hasattr(self, "sync_model_var"):
             self.config.set("sync_model", self.sync_model_var.get())
+        if hasattr(self, "caption_model_var"):
+            self.config.set("caption_dir", self.caption_dir)
+            self.config.set("caption_model", self.caption_model_var.get())
+            self.config.set("caption_language", self.caption_lang_var.get())
+            self.config.set("caption_fill_gaps", self.caption_fill_gaps_var.get())
+            self.config.set("caption_overwrite", self.cap_overwrite_var.get())
         self._save_voiceover_config()
         self.config.save()
 
@@ -3122,6 +3369,16 @@ class AppleStyleApp:
         if hasattr(self, "vo_manager") and self.vo_manager:
             self.vo_manager.destroy()
             self.vo_manager = None
+
+        # Reset Auto-Caption tab
+        if hasattr(self, "cap_btn"):
+            self.cap_btn.config_state("normal", text="💬  Generate Captions", bg=self.accent_color)
+            self.cap_cancel_btn.config_state("disabled", text="Cancel", bg="#E5E5EA")
+        if hasattr(self, "cap_select_frame"):
+            self.cap_select_frame.grid()
+        if hasattr(self, "caption_manager") and self.caption_manager:
+            self.caption_manager.destroy()
+            self.caption_manager = None
             
         self.dl_input_text.config(state="normal", bg="white")
         self.trans_input_text.config(state="normal", bg="white")

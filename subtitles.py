@@ -530,6 +530,60 @@ class WhisperAligner:
 
         return list(zip(starts, ends))
 
+    def transcribe_to_srt(
+        self,
+        audio_source: str,
+        srt_path: Path,
+        is_cancelled: CancelFn = lambda: False,
+        language: Optional[str] = None,
+        fill_gaps: bool = True,
+        min_duration: float = 0.3,
+        progress_callback: Optional[ProgressFn] = None,
+    ) -> bool:
+        """Transcribe ``audio_source`` from scratch and write a timed ``.srt``.
+
+        Unlike :meth:`align` (which re-times existing text), this creates captions
+        when there is no subtitle yet — Whisper supplies both the text and the
+        timestamps. ``fill_gaps`` keeps each caption on screen until the next.
+        """
+        if is_cancelled():
+            return False
+        model = self._ensure_model()
+        if is_cancelled():
+            return False
+
+        self.log("-> Transcribing audio for captions...")
+        kwargs = {}
+        if language:
+            kwargs["language"] = language
+        if progress_callback is not None:
+            kwargs["progress_callback"] = progress_callback
+        result = model.transcribe(audio_source, **kwargs)
+        if is_cancelled():
+            return False
+
+        segments = [s for s in result.segments if (s.text or "").strip()]
+        if not segments:
+            self.log("-> No speech detected; no captions written.")
+            return False
+
+        audio = self._whisper.load_audio(audio_source)
+        audio_duration = audio.shape[0] / float(WHISPER_SAMPLE_RATE)
+
+        raw_times = [(s.start, s.end) for s in segments]
+        texts = [s.text.strip() for s in segments]
+        cues = self._finalize_cues(
+            raw_times, audio_duration, UNALIGNED_INTERVAL, min_duration, fill_gaps,
+        )
+
+        with srt_path.open("w", encoding="utf-8") as f:
+            for i, ((start_time, end_time), text) in enumerate(zip(cues, texts), 1):
+                f.write(
+                    f"{i}\n{format_time(start_time)} --> {format_time(end_time)}\n{text}\n\n"
+                )
+        self.log(f"-> Captions written: {Path(srt_path).name}")
+        return True
+
     @staticmethod
     def _map_words_to_lines(valid_subs: Sequence[str], all_words: List) -> List[List]:
         """Walk the flat word list once, distributing words to lines by char count."""

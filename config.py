@@ -25,6 +25,12 @@ DEFAULTS: dict[str, Any] = {
     "export_ttml": False,
     "sync_fill_gaps": True,
     "sync_model": "small",
+    # --- Auto-Caption tab ---
+    "caption_dir": "",
+    "caption_model": "small",
+    "caption_language": "Auto",
+    "caption_fill_gaps": True,
+    "caption_overwrite": False,
     # --- Voiceover (dubbing) tab ---
     "vo_source_dir": "",
     "vo_sources": [],
