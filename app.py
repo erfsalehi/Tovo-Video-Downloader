@@ -1716,10 +1716,24 @@ class AppleStyleApp:
         ttk.Combobox(par, textvariable=self.shorts_wmodel_var, state="readonly", width=9,
                      values=["base", "small", "medium", "large-v3"],
                      font=(self.font_family, 10)).pack(side=tk.LEFT)
+
+        # Output mode + caption row
+        outrow = tk.Frame(card, bg=self.bg_color)
+        outrow.pack(fill="x", pady=(0, 8))
+        tk.Label(outrow, text="Output:", bg=self.bg_color, fg=self.text_color,
+                 font=(self.font_family, 10, "bold")).pack(side=tk.LEFT, padx=(0, 4))
+        self.shorts_output_var = tk.StringVar(
+            value=self.config.get("shorts_output_mode", "Vertical + captions"))
+        ttk.Combobox(outrow, textvariable=self.shorts_output_var, state="readonly", width=20,
+                     values=["Vertical + captions", "Lossless 16:9 cut"],
+                     font=(self.font_family, 10)).pack(side=tk.LEFT)
         self.shorts_burn_var = tk.BooleanVar(value=self.config.get("shorts_burn_captions", True))
-        ModernCheckbutton(par, text="Burn captions", variable=self.shorts_burn_var,
+        ModernCheckbutton(outrow, text="Burn captions (vertical only)", variable=self.shorts_burn_var,
                           bg_color=self.bg_color, command=self._save_config).pack(side=tk.LEFT, padx=(14, 0))
-        for v in (self.shorts_num_var, self.shorts_min_var, self.shorts_max_var, self.shorts_wmodel_var):
+        tk.Label(outrow, text="Lossless = instant raw cut, no re-encode",
+                 bg=self.bg_color, fg="#86868B", font=(self.font_family, 9)).pack(side=tk.LEFT, padx=(14, 0))
+        for v in (self.shorts_num_var, self.shorts_min_var, self.shorts_max_var,
+                  self.shorts_wmodel_var, self.shorts_output_var):
             v.trace_add("write", lambda *_: self._save_config())
 
         # Suggestions list
@@ -1857,19 +1871,29 @@ class AppleStyleApp:
         video = self.shorts_video
         outdir = Path(video).parent / "Shorts"
         outdir.mkdir(parents=True, exist_ok=True)
+        lossless = "Lossless" in self.shorts_output_var.get()
         burn = self.shorts_burn_var.get()
         segs = self._shorts_segments if burn else None
+        if lossless:
+            self.log("-> Lossless 16:9 mode — instant stream-copy cuts (no captions, no re-encode).")
         done = 0
         for i, c in enumerate(clips, 1):
             if self._is_cancelled():
                 break
             out = outdir / f"{i:02d} - {shortclips.safe_name(c['title'])}.mp4"
-            ok = shortclips.render_short(
-                ff, video, c["start"], c["end"], out, segments=segs, burn_captions=burn,
-                log=self.log,
-                register=lambda p: self._add_active_process(95000, p),
-                unregister=lambda p: self._remove_active_process(95000),
-            )
+            if lossless:
+                ok = shortclips.render_cut(
+                    ff, video, c["start"], c["end"], out, log=self.log,
+                    register=lambda p: self._add_active_process(95000, p),
+                    unregister=lambda p: self._remove_active_process(95000),
+                )
+            else:
+                ok = shortclips.render_short(
+                    ff, video, c["start"], c["end"], out, segments=segs, burn_captions=burn,
+                    log=self.log,
+                    register=lambda p: self._add_active_process(95000, p),
+                    unregister=lambda p: self._remove_active_process(95000),
+                )
             if ok:
                 done += 1
         if self._is_cancelled():
@@ -2083,6 +2107,7 @@ class AppleStyleApp:
             self.config.set("shorts_model", self.shorts_model_var.get().strip())
             self.config.set("shorts_caption_model", self.shorts_wmodel_var.get())
             self.config.set("shorts_burn_captions", self.shorts_burn_var.get())
+            self.config.set("shorts_output_mode", self.shorts_output_var.get())
             try:
                 self.config.set("shorts_num_clips", int(self.shorts_num_var.get()))
                 self.config.set("shorts_min_dur", int(self.shorts_min_var.get()))

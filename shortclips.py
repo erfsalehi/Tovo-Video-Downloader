@@ -200,6 +200,60 @@ def write_clip_srt(segments: List[Segment], start: float, end: float, out_srt: P
     return True
 
 
+def render_cut(
+    ffmpeg: str,
+    src_video: str,
+    start: float,
+    end: float,
+    out_path: Path,
+    log: LogFn = print,
+    register: Optional[Callable[[subprocess.Popen], None]] = None,
+    unregister: Optional[Callable[[subprocess.Popen], None]] = None,
+) -> bool:
+    """Cut [start, end] from ``src_video`` losslessly (stream copy, no re-encode,
+    original aspect ratio). Fast and cheap; the cut snaps to the nearest keyframe
+    at/just before ``start``. Returns True on success."""
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    dur = max(0.1, end - start)
+    cmd = [
+        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+        "-ss", f"{start:.3f}", "-i", str(src_video), "-t", f"{dur:.3f}",
+        "-c", "copy", "-avoid_negative_ts", "make_zero",
+        "-movflags", "+faststart", str(out_path),
+    ]
+    log(f"-> Cutting clip (lossless): {out_path.name}  ({start:.1f}s–{end:.1f}s)")
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, creationflags=_creationflags(),
+        )
+    except OSError as e:
+        log(f"[!] Failed to launch ffmpeg: {e}")
+        return False
+    if register:
+        register(proc)
+    tail: List[str] = []
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                tail.append(line)
+                if len(tail) > 15:
+                    tail.pop(0)
+        proc.wait()
+    finally:
+        if unregister:
+            unregister(proc)
+    if proc.returncode != 0:
+        log(f"[!] ffmpeg failed for {out_path.name}:")
+        for ln in tail[-5:]:
+            log(f"    {ln}")
+        return False
+    return out_path.exists()
+
+
 def render_short(
     ffmpeg: str,
     src_video: str,

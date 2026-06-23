@@ -39,6 +39,7 @@ DEFAULTS: dict[str, Any] = {
     "shorts_max_dur": 60,
     "shorts_caption_model": "small",
     "shorts_burn_captions": True,
+    "shorts_output_mode": "Vertical + captions",
     "shorts_dir": "",
     # --- Voiceover (dubbing) tab ---
     "vo_source_dir": "",
