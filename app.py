@@ -1146,10 +1146,16 @@ class AppleStyleApp:
         return GroqTranscriber(self.log, self.groq_key_var.get(),
                                proxy=self.proxy_url_var.get().strip())
 
-    def _vo_transcribe_with_retry(self, transcriber, audio_path: str, name: str,
-                                  attempts: int = 3) -> Optional[str]:
-        """Transcribe forced to English, retrying on transient failures (e.g. a
-        dropped SSL connection to Groq) so a network blip doesn't lose a clip."""
+    def _vo_local_fallback(self) -> Optional[WhisperAligner]:
+        """Lazily create (once) a local Whisper model used as an offline fallback
+        when Groq is unreachable."""
+        if getattr(self, "_vo_local_aligner", None) is None:
+            self.log("-> Loading local Whisper (offline fallback)…")
+            self._vo_local_aligner = WhisperAligner.try_create(self.log)
+        return self._vo_local_aligner
+
+    def _try_transcribe(self, transcriber, audio_path: str, name: str,
+                        attempts: int) -> Optional[str]:
         for attempt in range(1, attempts + 1):
             if self._is_cancelled():
                 return None
@@ -1163,8 +1169,33 @@ class AppleStyleApp:
                 time.sleep(2)
         return None
 
+    def _vo_transcribe_title(self, primary, audio_path: str, name: str,
+                             attempts: int = 3) -> Optional[str]:
+        """Transcribe the title (forced English). Tries the primary provider with
+        retries; if Groq is unreachable, falls back to a local Whisper model and
+        skips Groq for the rest of the batch so we don't hammer a dead endpoint."""
+        groq_primary = isinstance(primary, GroqTranscriber)
+        local_only = groq_primary and getattr(self, "_vo_groq_dead", False)
+
+        if not local_only:
+            text = self._try_transcribe(primary, audio_path, name, attempts)
+            if text:
+                return text
+            if not groq_primary:
+                return None  # local was already the primary; nothing else to try
+
+        local = self._vo_local_fallback()
+        if local is None:
+            self.log("[!] Local Whisper fallback unavailable (Whisper not installed).")
+            return None
+        if not local_only:
+            self.log("-> Groq unreachable; using local Whisper for the rest of this batch.")
+            self._vo_groq_dead = True
+        return self._try_transcribe(local, audio_path, name, attempts=1)
+
     def _voiceover_worker(self, specs: List[Dict]) -> None:
         self.log(f"\n--- Starting Voiceover ({len(specs)} clips) ---")
+        self._vo_groq_dead = False  # retry Groq fresh each run (VPN may be back up)
         rvc_dir = Path(self.rvc_dir)
         ffmpeg = str(BASE_PATH / "ffmpeg.exe")
         dub_dir = Path(self.dub_dir)
@@ -1233,7 +1264,7 @@ class AppleStyleApp:
                 if not voiceover.trim_clip(ffmpeg, str(path), str(title_clip), title_seconds, log=self.log):
                     title_clip = path  # fall back to the whole clip if the trim fails
 
-                transcript = self._vo_transcribe_with_retry(transcriber, str(title_clip), name)
+                transcript = self._vo_transcribe_title(transcriber, str(title_clip), name)
                 if self._is_cancelled():
                     break
                 if not transcript:
