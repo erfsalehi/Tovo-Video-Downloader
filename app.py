@@ -2200,6 +2200,8 @@ class AppleStyleApp:
         menubar.add_cascade(label="Tools", menu=tools_menu)
         tools_menu.add_command(label="Force Update yt-dlp & FFmpeg", command=lambda: threading.Thread(target=self._download_tools_thread, kwargs={"force_update": True}, daemon=True).start())
         tools_menu.add_command(label="Clear local cookies.txt", command=self.clear_local_cookies)
+        tools_menu.add_command(label="Re-download Whisper models (clear cache)",
+                               command=self.clear_whisper_cache)
         
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help", menu=help_menu)
@@ -2230,6 +2232,38 @@ class AppleStyleApp:
             self.log("-> Removed local cookies.txt")
         except OSError as e:
             self.log(f"-> Error removing cookies: {e}")
+
+    def clear_whisper_cache(self) -> None:
+        """Delete cached Whisper model files so they re-download cleanly next time.
+        Fixes the 'SHA256 checksum does not match' error from an interrupted download."""
+        root = os.getenv("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+        cache_dir = Path(root) / "whisper"
+        models = sorted(cache_dir.glob("*.pt")) if cache_dir.is_dir() else []
+        if not models:
+            messagebox.showinfo(
+                "Whisper Models",
+                f"No cached Whisper models found in:\n{cache_dir}\n\n"
+                "They'll be downloaded automatically next time you Sync, "
+                "Caption, or make Shorts.",
+            )
+            return
+        names = ", ".join(m.stem for m in models)
+        if not messagebox.askyesno(
+            "Re-download Whisper Models",
+            f"Delete {len(models)} cached Whisper model(s) ({names})?\n\n"
+            "They'll re-download automatically the next time they're needed. "
+            "Use this if a download was interrupted and you get a checksum error.",
+        ):
+            return
+        removed = 0
+        for m in models:
+            try:
+                m.unlink()
+                removed += 1
+            except OSError as e:
+                self.log(f"[!] Could not delete {m}: {e}")
+        self.log(f"-> Cleared {removed} Whisper model(s) from {cache_dir}. "
+                 "They'll re-download when next needed.")
 
     # ------------------------------------------------------------------
     # Logging
