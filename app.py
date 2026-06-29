@@ -101,6 +101,9 @@ class AppleStyleApp:
         self.root.minsize(700, 640)
 
         self.config = Config(BASE_PATH / "config.json")
+        # Migrate the stale default Shorts model to the current one.
+        if self.config.get("shorts_model") == "deepseek/deepseek-chat":
+            self.config.set("shorts_model", "deepseek/deepseek-v4-flash")
         if not self.config.get("downloads_dir"):
             self.config.set("downloads_dir", str(BASE_PATH / "Downloads"))
         self.downloads_dir = Path(self.config.get("downloads_dir"))
@@ -1686,7 +1689,7 @@ class AppleStyleApp:
         self.openrouter_key_entry.entry.bind("<FocusOut>", lambda e: self._save_config())
         tk.Label(orr, text="Model:", bg=self.bg_color, fg=self.text_color,
                  font=(self.font_family, 10, "bold")).grid(row=0, column=2, sticky="w", padx=(10, 8))
-        self.shorts_model_var = tk.StringVar(value=self.config.get("shorts_model", "deepseek/deepseek-chat"))
+        self.shorts_model_var = tk.StringVar(value=self.config.get("shorts_model", "deepseek/deepseek-v4-flash"))
         model_entry = RoundedEntry(orr, variable=self.shorts_model_var, radius=12,
                                    bg_color="white", width=200)
         model_entry.grid(row=0, column=3, sticky="e")
@@ -1814,35 +1817,37 @@ class AppleStyleApp:
                          args=(self.shorts_video,), daemon=True).start()
 
     def _shorts_analyze_worker(self, video: str) -> None:
-        self.log("\n--- Analyzing video for short clips ---")
-        aligner = WhisperAligner.try_create(self.log, model_name=self.shorts_wmodel_var.get())
-        if aligner is None:
-            self.log("[!] Shorts: local Whisper unavailable (install Whisper deps).")
-            self.root.after(0, self.reset_ui)
-            return
-        segs = aligner.transcribe_segments(str(video), is_cancelled=self._is_cancelled)
-        if self._is_cancelled():
-            self.root.after(0, self.reset_ui)
-            return
-        if not segs:
-            self.log("[!] Shorts: no speech found in the video.")
-            self.root.after(0, lambda: self._shorts_set_busy(False))
-            return
-        self._shorts_segments = segs
         try:
-            num = int(self.shorts_num_var.get())
-            mn = float(self.shorts_min_var.get())
-            mx = float(self.shorts_max_var.get())
-        except (ValueError, tk.TclError):
-            num, mn, mx = 5, 20.0, 60.0
-        clips = shortclips.find_highlights(
-            self.openrouter_key_var.get().strip(), self.shorts_model_var.get().strip(),
-            segs, num, mn, mx, log=self.log,
-            proxy=self.proxy_url_var.get().strip(), trust_env=True,
-        )
-        self._shorts_clips = clips
-        self.root.after(0, self._populate_shorts_list)
-        self.root.after(0, lambda: self._shorts_set_busy(False))
+            self.log("\n--- Analyzing video for short clips ---")
+            aligner = WhisperAligner.try_create(self.log, model_name=self.shorts_wmodel_var.get())
+            if aligner is None:
+                self.log("[!] Shorts: local Whisper unavailable (install Whisper deps).")
+                return
+            segs = aligner.transcribe_segments(str(video), is_cancelled=self._is_cancelled)
+            if self._is_cancelled():
+                return
+            if not segs:
+                self.log("[!] Shorts: no speech found in the video.")
+                return
+            self._shorts_segments = segs
+            try:
+                num = int(self.shorts_num_var.get())
+                mn = float(self.shorts_min_var.get())
+                mx = float(self.shorts_max_var.get())
+            except (ValueError, tk.TclError):
+                num, mn, mx = 5, 20.0, 60.0
+            clips = shortclips.find_highlights(
+                self.openrouter_key_var.get().strip(), self.shorts_model_var.get().strip(),
+                segs, num, mn, mx, log=self.log,
+                proxy=self.proxy_url_var.get().strip(), trust_env=True,
+            )
+            self._shorts_clips = clips
+            self.root.after(0, self._populate_shorts_list)
+        except Exception as e:
+            logger.exception("Shorts analyze failed")
+            self.log(f"[!] Shorts analyze error: {e}")
+        finally:
+            self.root.after(0, lambda: self._shorts_set_busy(False))
 
     def _populate_shorts_list(self) -> None:
         self.shorts_listbox.delete(0, tk.END)
@@ -1866,41 +1871,45 @@ class AppleStyleApp:
         threading.Thread(target=self._shorts_render_worker, args=(clips,), daemon=True).start()
 
     def _shorts_render_worker(self, clips: List[dict]) -> None:
-        self.log(f"\n--- Rendering {len(clips)} short(s) ---")
-        ff = str(BASE_PATH / "ffmpeg.exe")
-        video = self.shorts_video
-        outdir = Path(video).parent / "Shorts"
-        outdir.mkdir(parents=True, exist_ok=True)
-        lossless = "Lossless" in self.shorts_output_var.get()
-        burn = self.shorts_burn_var.get()
-        segs = self._shorts_segments if burn else None
-        if lossless:
-            self.log("-> Lossless 16:9 mode — instant stream-copy cuts (no captions, no re-encode).")
         done = 0
-        for i, c in enumerate(clips, 1):
-            if self._is_cancelled():
-                break
-            out = outdir / f"{i:02d} - {shortclips.safe_name(c['title'])}.mp4"
+        try:
+            self.log(f"\n--- Rendering {len(clips)} short(s) ---")
+            ff = str(BASE_PATH / "ffmpeg.exe")
+            video = self.shorts_video
+            outdir = Path(video).parent / "Shorts"
+            outdir.mkdir(parents=True, exist_ok=True)
+            lossless = "Lossless" in self.shorts_output_var.get()
+            burn = self.shorts_burn_var.get()
+            segs = self._shorts_segments if burn else None
             if lossless:
-                ok = shortclips.render_cut(
-                    ff, video, c["start"], c["end"], out, log=self.log,
-                    register=lambda p: self._add_active_process(95000, p),
-                    unregister=lambda p: self._remove_active_process(95000),
-                )
+                self.log("-> Lossless 16:9 mode — instant stream-copy cuts (no captions, no re-encode).")
+            for i, c in enumerate(clips, 1):
+                if self._is_cancelled():
+                    break
+                out = outdir / f"{i:02d} - {shortclips.safe_name(c['title'])}.mp4"
+                if lossless:
+                    ok = shortclips.render_cut(
+                        ff, video, c["start"], c["end"], out, log=self.log,
+                        register=lambda p: self._add_active_process(95000, p),
+                        unregister=lambda p: self._remove_active_process(95000),
+                    )
+                else:
+                    ok = shortclips.render_short(
+                        ff, video, c["start"], c["end"], out, segments=segs, burn_captions=burn,
+                        log=self.log,
+                        register=lambda p: self._add_active_process(95000, p),
+                        unregister=lambda p: self._remove_active_process(95000),
+                    )
+                if ok:
+                    done += 1
+            if self._is_cancelled():
+                self.log("\nShorts rendering cancelled by user.")
             else:
-                ok = shortclips.render_short(
-                    ff, video, c["start"], c["end"], out, segments=segs, burn_captions=burn,
-                    log=self.log,
-                    register=lambda p: self._add_active_process(95000, p),
-                    unregister=lambda p: self._remove_active_process(95000),
-                )
-            if ok:
-                done += 1
-        if self._is_cancelled():
-            self.log("\nShorts rendering cancelled by user.")
-            self.root.after(0, self.reset_ui)
-        else:
-            self.log(f"\n--- Done: {done}/{len(clips)} short(s) saved to {outdir} ---")
+                self.log(f"\n--- Done: {done}/{len(clips)} short(s) saved to {outdir} ---")
+        except Exception as e:
+            logger.exception("Shorts render failed")
+            self.log(f"[!] Shorts render error: {e}")
+        finally:
             self.root.after(0, lambda: self._shorts_set_busy(False))
 
     def _build_advanced_row(self, parent: tk.Frame, row: int) -> None:

@@ -318,8 +318,41 @@ class WhisperAligner:
     def _ensure_model(self):
         if self._model is None:
             self.log(f"-> Loading Whisper '{self.model_name}' model (one-time)...")
-            self._model = self._stable_whisper.load_model(self.model_name)
+            try:
+                self._model = self._stable_whisper.load_model(self.model_name)
+            except RuntimeError as e:
+                # A previous download was interrupted, leaving a corrupt cached
+                # file that Whisper refuses to load (SHA256 mismatch). Delete it
+                # and re-download once.
+                if "checksum" not in str(e).lower() and "sha256" not in str(e).lower():
+                    raise
+                self.log("-> Cached Whisper model is corrupt (interrupted download); "
+                         "deleting it and re-downloading…")
+                if self._delete_cached_model():
+                    self._model = self._stable_whisper.load_model(self.model_name)
+                else:
+                    raise
         return self._model
+
+    def _delete_cached_model(self) -> bool:
+        """Remove the cached .pt for this model so it can be re-downloaded clean.
+        Returns True if a file was found and deleted."""
+        try:
+            import whisper  # type: ignore
+            url = whisper._MODELS.get(self.model_name)
+            if not url:
+                return False
+            root = os.getenv("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+            target = os.path.join(root, "whisper", os.path.basename(url))
+            if os.path.isfile(target):
+                os.remove(target)
+                self.log(f"-> Removed corrupt model file: {target}")
+                return True
+            self.log(f"[!] Corrupt model file not found at {target}; will retry download.")
+            return True  # let load_model attempt a fresh download anyway
+        except Exception:
+            logger.exception("Could not delete cached Whisper model")
+            return False
 
     def transcribe_to_text(
         self,

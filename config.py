@@ -33,7 +33,7 @@ DEFAULTS: dict[str, Any] = {
     "caption_overwrite": False,
     # --- Short Clips tab ---
     "openrouter_api_key": "",
-    "shorts_model": "deepseek/deepseek-chat",
+    "shorts_model": "deepseek/deepseek-v4-flash",
     "shorts_num_clips": 5,
     "shorts_min_dur": 20,
     "shorts_max_dur": 60,
