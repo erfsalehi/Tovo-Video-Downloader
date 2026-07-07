@@ -25,6 +25,32 @@ def _ffmpeg_exe() -> str:
         return str(local)
     return shutil.which("ffmpeg") or "ffmpeg"
 
+
+class _Resp:
+    """Minimal requests.Response stand-in for curl output (status + text)."""
+    __slots__ = ("status_code", "text")
+
+    def __init__(self, status_code: int, text: str) -> None:
+        self.status_code = status_code
+        self.text = text
+
+
+def _curl_exe() -> Optional[str]:
+    """Locate curl. Bundled with Windows 10/11. Used to reach api.groq.com, which
+    sits behind Cloudflare: Cloudflare resets Python requests/urllib3's TLS
+    handshake (its ClientHello reads as a bot) with 'SSL:
+    UNEXPECTED_EOF_WHILE_READING'. OS-native curl (Schannel on Windows) uses a
+    browser-like fingerprint Cloudflare accepts."""
+    exe = shutil.which("curl")
+    if exe:
+        return exe
+    if os.name == "nt":
+        sys32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                             "System32", "curl.exe")
+        if os.path.isfile(sys32):
+            return sys32
+    return None
+
 LogFn = Callable[[str], None]
 CancelFn = Callable[[], bool]
 # ProgressCallback: (current_seconds, total_seconds)
@@ -676,6 +702,68 @@ class GroqTranscriber:
         self.trust_env = trust_env
         self.url = "https://api.groq.com/openai/v1/audio/transcriptions"
 
+    def _upload(self, temp_audio: str, data: dict):
+        """POST the prepared audio to Groq. Prefer OS-native curl because
+        api.groq.com sits behind Cloudflare, which resets Python requests' TLS
+        handshake ('SSL: UNEXPECTED_EOF_WHILE_READING'). Fall back to requests
+        when curl is missing or fails to run. Returns an object exposing
+        ``.status_code`` and ``.text`` (both curl and requests responses do)."""
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        exe = _curl_exe()
+        if exe:
+            try:
+                return self._upload_via_curl(exe, temp_audio, data, headers)
+            except RuntimeError as e:
+                self.log(f"-> curl upload failed ({e}); retrying with Python requests...")
+
+        with open(temp_audio, "rb") as f:
+            files = {"file": (os.path.basename(temp_audio), f, "audio/mpeg")}
+            proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
+            session = requests.Session()
+            session.trust_env = self.trust_env  # honour "Disable System Proxy"
+            return session.post(
+                self.url, headers=headers, files=files, data=data,
+                timeout=60, proxies=proxies,
+            )
+
+    def _upload_via_curl(self, exe: str, temp_audio: str, data: dict,
+                         headers: dict) -> _Resp:
+        """Multipart file upload to Groq via curl. Returns _Resp for any HTTP
+        reply (including 4xx/5xx); raises RuntimeError on a connection-level
+        failure so the caller can fall back to requests."""
+        timeout = 120
+        args = [exe, "-sS", "--max-time", str(timeout), "-w", "\n%{http_code}",
+                "-X", "POST", self.url]
+        for k, v in headers.items():
+            args += ["-H", f"{k}: {v}"]
+        args += ["-F", f"file=@{temp_audio};type=audio/mpeg"]
+        for k, v in data.items():
+            args += ["-F", f"{k}={v}"]
+        # Mirror requests' proxy behaviour: explicit proxy wins; otherwise honour
+        # env proxies when trust_env, or force a direct route when not.
+        if self.proxy:
+            args += ["-x", self.proxy]
+        elif not self.trust_env:
+            args += ["--noproxy", "*"]
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        try:
+            proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  timeout=timeout + 15, creationflags=creationflags)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise RuntimeError(f"curl failed to run: {e}")
+        if proc.returncode != 0:
+            err = proc.stderr.decode("utf-8", "replace").strip()
+            raise RuntimeError(f"curl exit {proc.returncode}: {err[:200]}")
+        out = proc.stdout.decode("utf-8", "replace")
+        nl = out.rfind("\n")
+        code_str = (out[nl + 1:] if nl >= 0 else out).strip()
+        body = out[:nl] if nl >= 0 else ""
+        try:
+            status = int(code_str)
+        except ValueError:
+            raise RuntimeError(f"curl returned no HTTP status (got {code_str!r})")
+        return _Resp(status, body)
+
     def transcribe_to_text(
         self,
         audio_path: str,
@@ -704,26 +792,18 @@ class GroqTranscriber:
             if is_cancelled():
                 return None
             self.log("-> Uploading to Groq AI (Whisper-large-v3)...")
-            
+
             if progress_callback:
                 progress_callback(50, 100) # Mock 50% for upload started
 
-            with open(temp_audio, "rb") as f:
-                files = {"file": (os.path.basename(temp_audio), f, "audio/mpeg")}
-                data = {
-                    "model": "whisper-large-v3",
-                    "response_format": "text"
-                }
-                if language:
-                    data["language"] = language
-                headers = {"Authorization": f"Bearer {self.api_key}"}
-                proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
-                session = requests.Session()
-                session.trust_env = self.trust_env  # honour "Disable System Proxy"
-                response = session.post(
-                    self.url, headers=headers, files=files, data=data,
-                    timeout=60, proxies=proxies,
-                )
+            data = {
+                "model": "whisper-large-v3",
+                "response_format": "text"
+            }
+            if language:
+                data["language"] = language
+
+            response = self._upload(temp_audio, data)
 
             if response.status_code != 200:
                 self.log(f"[!] Groq API Error: {response.status_code} - {response.text}")

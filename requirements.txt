@@ -18,6 +18,12 @@ stable-ts>=2.17.0
 # Network requests for Groq API
 requests>=2.31.0
 
+# Short Clips: rounded-pill burned captions with correct Persian/Arabic shaping.
+# Pillow renders the caption images; the other two shape + reorder RTL text.
+Pillow>=9.2.0
+arabic_reshaper>=3.0.0
+python-bidi>=0.4.2
+
 # System dependencies (install separately):
 #   - ffmpeg (required)
 #   - deno   (required by yt-dlp for some YouTube extractors)

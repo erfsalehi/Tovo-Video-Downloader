@@ -247,7 +247,15 @@ class AppleStyleApp:
             text_color="#86868B", font=(self.font_family, 11, "bold"),
             width=120, height=44
         )
-        self.btn_shorts_tab.pack(side=tk.LEFT)
+        self.btn_shorts_tab.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.btn_t2s_tab = RoundedButton(
+            tab_frame, text="Text → SRT", command=lambda: self._switch_tab("t2s"),
+            radius=20, bg_color=self.bg_color, hover_color=self.gray_hover,
+            text_color="#86868B", font=(self.font_family, 11, "bold"),
+            width=120, height=44
+        )
+        self.btn_t2s_tab.pack(side=tk.LEFT)
 
         # Tab Content Area
         self.content_frame = tk.Frame(container, bg=self.bg_color)
@@ -285,6 +293,11 @@ class AppleStyleApp:
         self.shorts_tab.grid(row=0, column=0, sticky="nsew")
         self._build_shorts_tab(self.shorts_tab)
 
+        # Tab 7: Text to SRT
+        self.t2s_tab = tk.Frame(self.content_frame, bg=self.bg_color)
+        self.t2s_tab.grid(row=0, column=0, sticky="nsew")
+        self._build_txt2srt_tab(self.t2s_tab)
+
         # Initial State
         self._switch_tab("dl")
 
@@ -299,6 +312,7 @@ class AppleStyleApp:
             "vo": (self.vo_tab, self.btn_vo_tab),
             "cap": (self.cap_tab, self.btn_cap_tab),
             "shorts": (self.shorts_tab, self.btn_shorts_tab),
+            "t2s": (self.t2s_tab, self.btn_t2s_tab),
         }
         if tab not in tabs:
             return
@@ -1689,7 +1703,7 @@ class AppleStyleApp:
         self.openrouter_key_entry.entry.bind("<FocusOut>", lambda e: self._save_config())
         tk.Label(orr, text="Model:", bg=self.bg_color, fg=self.text_color,
                  font=(self.font_family, 10, "bold")).grid(row=0, column=2, sticky="w", padx=(10, 8))
-        self.shorts_model_var = tk.StringVar(value=self.config.get("shorts_model", "deepseek/deepseek-v4-flash"))
+        self.shorts_model_var = tk.StringVar(value=self.config.get("shorts_model", "deepseek/deepseek-v4-pro"))
         model_entry = RoundedEntry(orr, variable=self.shorts_model_var, radius=12,
                                    bg_color="white", width=200)
         model_entry.grid(row=0, column=3, sticky="e")
@@ -1715,9 +1729,15 @@ class AppleStyleApp:
         tk.Label(par, text="s", bg=self.bg_color, fg=self.text_color).pack(side=tk.LEFT, padx=(2, 0))
         tk.Label(par, text="Whisper:", bg=self.bg_color, fg=self.text_color,
                  font=(self.font_family, 10, "bold")).pack(side=tk.LEFT, padx=(14, 4))
-        self.shorts_wmodel_var = tk.StringVar(value=self.config.get("shorts_caption_model", "small"))
+        self.shorts_wmodel_var = tk.StringVar(value=self.config.get("shorts_caption_model", "medium"))
         ttk.Combobox(par, textvariable=self.shorts_wmodel_var, state="readonly", width=9,
                      values=["base", "small", "medium", "large-v3"],
+                     font=(self.font_family, 10)).pack(side=tk.LEFT)
+        tk.Label(par, text="Lang:", bg=self.bg_color, fg=self.text_color,
+                 font=(self.font_family, 10, "bold")).pack(side=tk.LEFT, padx=(14, 4))
+        self.shorts_lang_var = tk.StringVar(value=self.config.get("shorts_language", "Persian"))
+        ttk.Combobox(par, textvariable=self.shorts_lang_var, state="readonly", width=9,
+                     values=["Auto", "Persian", "English"],
                      font=(self.font_family, 10)).pack(side=tk.LEFT)
 
         # Output mode + caption row
@@ -1735,8 +1755,13 @@ class AppleStyleApp:
                           bg_color=self.bg_color, command=self._save_config).pack(side=tk.LEFT, padx=(14, 0))
         tk.Label(outrow, text="Lossless = instant raw cut, no re-encode",
                  bg=self.bg_color, fg="#86868B", font=(self.font_family, 9)).pack(side=tk.LEFT, padx=(14, 0))
+        self.shorts_test_btn = RoundedButton(
+            outrow, text="Test Connection", command=self.start_shorts_test, radius=14,
+            bg_color=self.gray_bg, hover_color=self.gray_hover, text_color=self.text_color,
+            font=(self.font_family, 10, "bold"), width=160, height=32)
+        self.shorts_test_btn.pack(side=tk.RIGHT)
         for v in (self.shorts_num_var, self.shorts_min_var, self.shorts_max_var,
-                  self.shorts_wmodel_var, self.shorts_output_var):
+                  self.shorts_wmodel_var, self.shorts_lang_var, self.shorts_output_var):
             v.trace_add("write", lambda *_: self._save_config())
 
         # Suggestions list
@@ -1801,6 +1826,32 @@ class AppleStyleApp:
             "disabled" if busy else "normal", bg="#E5E5EA" if busy else "#34C759")
         self.shorts_cancel_btn.config_state(
             "normal" if busy else "disabled", bg="#FF3B30" if busy else "#E5E5EA")
+        if hasattr(self, "shorts_test_btn"):
+            self.shorts_test_btn.config_state(
+                "disabled" if busy else "normal", bg="#E5E5EA" if busy else self.gray_bg)
+
+    def start_shorts_test(self) -> None:
+        """Probe the OpenRouter connection so the user can tell a network/VPN
+        problem apart from an app problem before running a full analysis."""
+        if getattr(self, "_shorts_testing", False):
+            return
+        self._shorts_testing = True
+        self.shorts_test_btn.config_state("disabled", bg="#E5E5EA")
+        key = self.openrouter_key_var.get().strip()
+        threading.Thread(target=self._shorts_test_worker, args=(key,), daemon=True).start()
+
+    def _shorts_test_worker(self, key: str) -> None:
+        try:
+            self.log("\n--- Testing OpenRouter connection ---")
+            shortclips.test_connection(
+                key, proxy=self.proxy_url_var.get().strip(), trust_env=True, log=self.log)
+        except Exception as e:
+            logger.exception("Shorts connection test failed")
+            self.log(f"[!] Shorts: connection test error: {e}")
+        finally:
+            self._shorts_testing = False
+            self.root.after(0, lambda: self.shorts_test_btn.config_state(
+                "normal", bg=self.gray_bg))
 
     def start_shorts_analyze(self) -> None:
         if self.downloading:
@@ -1823,7 +1874,9 @@ class AppleStyleApp:
             if aligner is None:
                 self.log("[!] Shorts: local Whisper unavailable (install Whisper deps).")
                 return
-            segs = aligner.transcribe_segments(str(video), is_cancelled=self._is_cancelled)
+            lang = {"Persian": "fa", "English": "en"}.get(self.shorts_lang_var.get())
+            segs = aligner.transcribe_segments(
+                str(video), is_cancelled=self._is_cancelled, language=lang)
             if self._is_cancelled():
                 return
             if not segs:
@@ -2058,6 +2111,149 @@ class AppleStyleApp:
         self.trans_cancel_btn.grid(row=0, column=1, sticky="ew")
         self.trans_cancel_btn.config_state("disabled", bg="#E5E5EA")
 
+    # ------------------------------------------------------------------
+    # Text to SRT tab
+    # ------------------------------------------------------------------
+    def _build_txt2srt_tab(self, parent: tk.Frame) -> None:
+        # Runs during _build_ui, before the per-tab state block, so seed the
+        # output folder from config here (defaults to the Downloads folder).
+        self.txt2srt_dir = Path(self.config.get("txt2srt_dir", str(self.downloads_dir)))
+
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(2, weight=1, minsize=160)
+
+        tk.Label(
+            parent, text="Text to SRT", bg=self.bg_color, fg=self.text_color,
+            font=(self.font_family, 22, "bold"),
+        ).grid(row=0, column=0, sticky="w", pady=(20, 2), padx=10)
+
+        tk.Label(
+            parent,
+            text="Paste your text — each line becomes one subtitle, timed to a fixed "
+                 "2-second interval (0–2s, 2–4s, …). Blank lines are skipped.",
+            bg=self.bg_color, fg="#86868B", font=(self.font_family, 10), justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(0, 8), padx=10)
+
+        border = tk.Frame(parent, bg="#D2D2D7")
+        border.grid(row=2, column=0, sticky="nsew", pady=(0, 12), padx=10)
+        border.grid_columnconfigure(0, weight=1)
+        border.grid_rowconfigure(0, weight=1)
+
+        inner = tk.Frame(border, bg="white")
+        inner.grid(row=0, column=0, sticky="nsew", padx=1, pady=1)
+        inner.grid_columnconfigure(0, weight=1)
+        inner.grid_rowconfigure(0, weight=1)
+
+        self.t2s_input_text = tk.Text(
+            inner, wrap=tk.WORD, font=(self.font_family, 11),
+            bg="white", fg=self.text_color, insertbackground=self.accent_color,
+            relief=tk.FLAT, padx=10, pady=10, undo=True,
+            height=6, width=1,  # small request; grid weight lets it expand
+        )
+        self.t2s_input_text.grid(row=0, column=0, sticky="nsew")
+
+        scroll = tk.Scrollbar(inner, command=self.t2s_input_text.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.t2s_input_text.config(yscrollcommand=scroll.set)
+        self._bind_context_menu(self.t2s_input_text)
+
+        # Save-to folder row
+        save_frame = tk.Frame(parent, bg=self.bg_color)
+        save_frame.grid(row=3, column=0, sticky="ew", pady=(0, 6), padx=10)
+        save_frame.grid_columnconfigure(1, weight=1)
+
+        tk.Label(
+            save_frame, text="Save to:", bg=self.bg_color, fg=self.text_color,
+            font=(self.font_family, 10, "bold"),
+        ).grid(row=0, column=0, sticky="w", padx=(0, 8))
+
+        self.t2s_dir_label = tk.Label(
+            save_frame, text=str(self.txt2srt_dir), bg=self.bg_color, fg="#5E5CE6",
+            font=(self.font_family, 10), anchor="w",
+        )
+        self.t2s_dir_label.grid(row=0, column=1, sticky="ew")
+        self.t2s_dir_label.bind("<Configure>", lambda e: self.t2s_dir_label.config(
+            text=self._truncate(str(self.txt2srt_dir), e.width, (self.font_family, 10))
+        ))
+
+        RoundedButton(
+            save_frame, text="Browse…", command=self.browse_txt2srt_directory,
+            radius=14, bg_color=self.gray_bg, hover_color=self.gray_hover,
+            text_color=self.text_color, font=(self.font_family, 10, "bold"),
+            width=90, height=32,
+        ).grid(row=0, column=2, sticky="e", padx=(6, 0))
+
+        # File name row
+        name_frame = tk.Frame(parent, bg=self.bg_color)
+        name_frame.grid(row=4, column=0, sticky="ew", pady=(0, 6), padx=10)
+        name_frame.grid_columnconfigure(1, weight=1)
+
+        tk.Label(
+            name_frame, text="File name:", bg=self.bg_color, fg=self.text_color,
+            font=(self.font_family, 10, "bold"),
+        ).grid(row=0, column=0, sticky="w", padx=(0, 8))
+
+        self.t2s_name_var = tk.StringVar(value="subtitles")
+        name_border = tk.Frame(name_frame, bg="#D2D2D7")
+        name_border.grid(row=0, column=1, sticky="ew")
+        name_border.grid_columnconfigure(0, weight=1)
+        tk.Entry(
+            name_border, textvariable=self.t2s_name_var, font=(self.font_family, 11),
+            bg="white", fg=self.text_color, insertbackground=self.accent_color,
+            relief=tk.FLAT,
+        ).grid(row=0, column=0, sticky="ew", padx=1, pady=1, ipady=5)
+
+        tk.Label(
+            name_frame, text=".srt", bg=self.bg_color, fg="#86868B",
+            font=(self.font_family, 10),
+        ).grid(row=0, column=2, sticky="w", padx=(6, 0))
+
+        # Generate button
+        btn_frame = tk.Frame(parent, bg=self.bg_color)
+        btn_frame.grid(row=5, column=0, sticky="ew", pady=(8, 16), padx=10)
+        btn_frame.grid_columnconfigure(0, weight=1)
+        RoundedButton(
+            btn_frame, text="📝  Generate SRT", command=self.generate_txt2srt,
+            radius=22, bg_color=self.accent_color, hover_color=self.accent_hover,
+            text_color="white", font=(self.font_family, 12, "bold"), height=46,
+        ).grid(row=0, column=0, sticky="ew")
+
+    def browse_txt2srt_directory(self) -> None:
+        selected = filedialog.askdirectory(
+            initialdir=str(self.txt2srt_dir), title="Select SRT Save Location",
+        )
+        if selected:
+            self.txt2srt_dir = Path(selected)
+            self.t2s_dir_label.config(text=str(self.txt2srt_dir))
+            self._save_config()
+
+    def generate_txt2srt(self) -> None:
+        raw = self.t2s_input_text.get("1.0", tk.END)
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        if not lines:
+            self.log("[!] Text to SRT: paste some text first (one line per subtitle).")
+            messagebox.showinfo("Text to SRT", "Please paste some text first — "
+                                "each non-empty line becomes one subtitle.")
+            return
+
+        name = sanitize_filename(self.t2s_name_var.get().strip() or "subtitles")
+        if name.lower().endswith(".srt"):
+            name = name[:-4]
+        try:
+            self.txt2srt_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self.log(f"[!] Text to SRT: cannot create folder: {e}")
+            messagebox.showerror("Text to SRT", f"Could not create folder:\n{e}")
+            return
+
+        srt_path = self.txt2srt_dir / f"{name}.srt"
+        if generate_standard_srt(lines, srt_path, self.log):
+            self.log(f"-> Saved: {srt_path}")
+            messagebox.showinfo(
+                "Text to SRT",
+                f"Created {len(lines)} subtitles (2s each).\n\nSaved to:\n{srt_path}",
+            )
+
     def _build_log_area(self, parent: tk.Frame) -> None:
         # Dark terminal log box with rounded border simulation
         outer = tk.Frame(parent, bg="#3A3A3C", pady=2, padx=2)
@@ -2087,6 +2283,8 @@ class AppleStyleApp:
     def _save_config(self) -> None:
         self.config.set("downloads_dir", str(self.downloads_dir))
         self.config.set("trans_dir", str(self.trans_dir))
+        if hasattr(self, "txt2srt_dir"):
+            self.config.set("txt2srt_dir", str(self.txt2srt_dir))
         self.config.set("dub_dir", self.dub_dir)
         self.config.set("concurrent_downloads", self.concurrent_var.get())
         self.config.set("max_concurrent", self.max_concurrent_var.get())
@@ -3729,6 +3927,8 @@ class AppleStyleApp:
             self.shorts_analyze_btn.config_state("normal", bg=self.accent_color)
             self.shorts_render_btn.config_state("normal", bg="#34C759")
             self.shorts_cancel_btn.config_state("disabled", text="Cancel", bg="#E5E5EA")
+        if hasattr(self, "shorts_test_btn"):
+            self.shorts_test_btn.config_state("normal", bg=self.gray_bg)
             
         self.dl_input_text.config(state="normal", bg="white")
         self.trans_input_text.config(state="normal", bg="white")
