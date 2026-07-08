@@ -1128,6 +1128,16 @@ class AppleStyleApp:
             resample_sr=int(base.get("resample_sr", 0)),
         )
 
+    def _review_state_active(self) -> bool:
+        """True if a tab is sitting in its post-batch "Finish & Return" review
+        state. The shared ``self.downloading`` flag stays True then, but nothing
+        is actually running — so another tab's Start can safely clear it."""
+        for attr in ("download_btn", "trans_btn", "sync_btn", "vo_btn", "cap_btn"):
+            btn = getattr(self, attr, None)
+            if btn is not None and getattr(btn, "text", "") == "Finish & Return":
+                return True
+        return False
+
     def start_voiceover(self) -> None:
         """Start button for the Voiceover tab. In the post-batch review state it
         just returns to the start screen, mirroring the other tabs."""
@@ -1135,7 +1145,17 @@ class AppleStyleApp:
             self.reset_ui()
             return
         if self.downloading:
-            return
+            # Another tab may just be parked in its "Finish & Return" review
+            # state (e.g. a finished transcription batch) — that keeps
+            # `downloading` True even though no job is running, which used to
+            # make this button silently do nothing. Clear that stale review and
+            # continue; only block when a job is genuinely still active.
+            if self._review_state_active():
+                self.reset_ui()
+            else:
+                self.log("[!] Voiceover: another job is still running — cancel it "
+                         "or let it finish before starting a voiceover.")
+                return
 
         sources = [s for s in self.vo_sources
                    if Path(s).is_dir() or (Path(s).is_file() and s.lower().endswith(".zip"))]
