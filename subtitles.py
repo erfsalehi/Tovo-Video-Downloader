@@ -26,6 +26,15 @@ def _ffmpeg_exe() -> str:
     return shutil.which("ffmpeg") or "ffmpeg"
 
 
+def _safe_remove(path: Optional[str]) -> None:
+    """Delete a temp file if it exists, ignoring errors."""
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 class _Resp:
     """Minimal requests.Response stand-in for curl output (status + text)."""
     __slots__ = ("status_code", "text")
@@ -74,7 +83,7 @@ def read_srt_cues(path: Path) -> List[str]:
 
     Each returned entry is one cue's text (multi-line cues are joined with a
     space), preserving order so the result can be fed straight back into
-    :meth:`WhisperAligner.align` to re-time it against an audio track.
+    :meth:`GroqTranscriber.align` to re-time it against an audio track.
     """
     try:
         raw = Path(path).read_text(encoding="utf-8", errors="ignore")
@@ -315,378 +324,118 @@ def write_ttml(
     return True
 
 
-class WhisperAligner:
-    """Lazily loads Whisper once, then reuses the model across batch items."""
+# ----------------------------------------------------------------------
+# Timestamp / cue helpers (transcription-engine agnostic)
+#
+# These operate on plain word/segment objects exposing ``.word``/``.text`` plus
+# ``.start``/``.end``, so the same alignment math works whether the timestamps
+# came from a local model or Groq's verbose_json response.
+# ----------------------------------------------------------------------
+class _Word:
+    """Normalised word timestamp (word text + start/end seconds)."""
+    __slots__ = ("word", "start", "end")
 
-    def __init__(self, log: LogFn, model_name: str = "base") -> None:
-        self.log = log
-        self.model_name = model_name
-        self._stable_whisper = None
-        self._whisper = None
-        self._model = None
+    def __init__(self, word: str, start: float, end: float) -> None:
+        self.word, self.start, self.end = word, start, end
 
-    @classmethod
-    def try_create(cls, log: LogFn, model_name: str = "base") -> Optional["WhisperAligner"]:
-        """Return an aligner if Whisper deps import cleanly, else ``None``."""
-        try:
-            import warnings
-            warnings.filterwarnings("ignore")
-            import stable_whisper  # type: ignore
-            import whisper  # type: ignore
-        except ImportError as e:
-            log(f"[!] Whisper or Torch not available ({e.name}). Falling back to standard sync.")
-            return None
-        instance = cls(log, model_name)
-        instance._stable_whisper = stable_whisper
-        instance._whisper = whisper
-        return instance
 
-    def _ensure_model(self):
-        if self._model is None:
-            self.log(f"-> Loading Whisper '{self.model_name}' model (one-time)...")
-            try:
-                self._model = self._stable_whisper.load_model(self.model_name)
-            except RuntimeError as e:
-                # A previous download was interrupted, leaving a corrupt cached
-                # file that Whisper refuses to load (SHA256 mismatch). Delete it
-                # and re-download once.
-                if "checksum" not in str(e).lower() and "sha256" not in str(e).lower():
-                    raise
-                self.log("-> Cached Whisper model is corrupt (interrupted download); "
-                         "deleting it and re-downloading…")
-                if self._delete_cached_model():
-                    self._model = self._stable_whisper.load_model(self.model_name)
-                else:
-                    raise
-        return self._model
+class _Seg:
+    """Normalised segment timestamp (text + start/end seconds)."""
+    __slots__ = ("text", "start", "end")
 
-    def _delete_cached_model(self) -> bool:
-        """Remove the cached .pt for this model so it can be re-downloaded clean.
-        Returns True if a file was found and deleted."""
-        try:
-            import whisper  # type: ignore
-            url = whisper._MODELS.get(self.model_name)
-            if not url:
-                return False
-            root = os.getenv("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
-            target = os.path.join(root, "whisper", os.path.basename(url))
-            if os.path.isfile(target):
-                os.remove(target)
-                self.log(f"-> Removed corrupt model file: {target}")
-                return True
-            self.log(f"[!] Corrupt model file not found at {target}; will retry download.")
-            return True  # let load_model attempt a fresh download anyway
-        except Exception:
-            logger.exception("Could not delete cached Whisper model")
-            return False
+    def __init__(self, text: str, start: float, end: float) -> None:
+        self.text, self.start, self.end = text, start, end
 
-    def transcribe_to_text(
-        self,
-        audio_source: str,
-        is_cancelled: CancelFn = lambda: False,
-        progress_callback: Optional[ProgressFn] = None,
-        language: Optional[str] = None,
-    ) -> Optional[str]:
-        """Transcribe ``audio_source`` and return the full text transcript.
 
-        Pass ``language`` (e.g. ``"en"``) to force a language instead of letting
-        Whisper auto-detect it."""
-        if is_cancelled():
-            return None
-        model = self._ensure_model()
+def _get(obj, key, default=None):
+    """Read ``key`` from either a mapping or an attribute-bearing object."""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
 
-        if is_cancelled():
-            return None
-        self.log("-> Transcribing audio with Whisper AI (Full Transcript)...")
 
-        # stable-whisper supports progress_callback
-        kwargs = {"progress_callback": progress_callback}
-        if language:
-            kwargs["language"] = language
-        result = model.transcribe(audio_source, **kwargs)
+def _as_words(resp) -> List[_Word]:
+    """Normalise a Groq verbose_json ``.words`` list into _Word objects."""
+    out: List[_Word] = []
+    for w in (_get(resp, "words", None) or []):
+        s, e = _get(w, "start"), _get(w, "end")
+        if s is None or e is None:
+            continue
+        out.append(_Word(str(_get(w, "word", "")), float(s), float(e)))
+    return out
 
-        if is_cancelled():
-            return None
 
-        # Concatenate segments into a clean paragraph
-        text = " ".join([s.text.strip() for s in result.segments])
-        self.log(f"-> Whisper transcription successful!")
-        return text
+def _as_segments(resp) -> List[_Seg]:
+    """Normalise a Groq verbose_json ``.segments`` list into _Seg objects."""
+    out: List[_Seg] = []
+    for s in (_get(resp, "segments", None) or []):
+        st, en = _get(s, "start"), _get(s, "end")
+        if st is None or en is None:
+            continue
+        out.append(_Seg(str(_get(s, "text", "")), float(st), float(en)))
+    return out
 
-    def align(
-        self,
-        audio_source: str,
-        subs: Sequence[str],
-        srt_path: Path,
-        is_cancelled: CancelFn = lambda: False,
-        unaligned_interval: float = UNALIGNED_INTERVAL,
-        progress_callback: Optional[ProgressFn] = None,
-        fill_gaps: bool = True,
-        min_duration: float = 0.3,
-    ) -> bool:
-        """Align ``subs`` to ``audio_source`` and write an SRT file.
 
-        Each input line is aligned to the audio as its own cue (via stable-whisper
-        ``original_split``), giving accurate per-line start/end times. Lines whose
-        speech extends past the audio (e.g. the dub ends before the original) are
-        fanned out into sequential ``unaligned_interval``-second cues so they stay
-        visible.
+def _map_words_to_lines(valid_subs: Sequence[str], all_words: List) -> List[List]:
+    """Walk the flat word list once, distributing words to lines by char count."""
+    mapping: List[List] = []
+    word_idx = 0
+    for line in valid_subs:
+        target_len = len(line.replace(" ", "").replace("\n", ""))
+        chars = 0
+        words: List = []
+        while chars < target_len and word_idx < len(all_words):
+            w = all_words[word_idx]
+            chars += len(w.word.replace(" ", ""))
+            words.append(w)
+            word_idx += 1
+        mapping.append(words)
+    return mapping
 
-        When ``fill_gaps`` is True, each cue is extended to end exactly where the
-        next one starts, so a line stays on screen through any pause/silence until
-        the following line begins (the trailing silence belongs to the previous
-        line). The final cue runs to the end of the audio.
-        """
-        if is_cancelled():
-            return False
-        model = self._ensure_model()
 
-        if is_cancelled():
-            return False
-        self.log("-> Analyzing audio for language detection...")
-        audio = self._whisper.load_audio(audio_source)
-        audio_duration = audio.shape[0] / float(WHISPER_SAMPLE_RATE)
+def _finalize_cues(
+    raw_times: Sequence[Tuple[Optional[float], Optional[float]]],
+    audio_duration: float,
+    unaligned_interval: float,
+    min_duration: float,
+    fill_gaps: bool,
+) -> List[Tuple[float, float]]:
+    """Turn raw per-line times into clean, ordered, non-overlapping cues."""
+    n = len(raw_times)
+    starts: List[float] = [0.0] * n
+    ends: List[float] = [0.0] * n
 
-        trimmed = self._whisper.pad_or_trim(audio)
-        mel = self._whisper.log_mel_spectrogram(trimmed).to(model.device)
-        _, probs = model.detect_language(mel)
-        detected_lang = max(probs, key=probs.get)
-        self.log(f"-> Detected language: '{detected_lang}'")
+    # Pass 1: fill in unaligned lines sequentially; clamp to valid ranges.
+    last_end = 0.0
+    for i, (s, e) in enumerate(raw_times):
+        if s is None or e is None:
+            s = last_end
+            e = s + unaligned_interval
+        s = max(0.0, s)
+        e = max(e, s + min_duration)
+        starts[i], ends[i] = s, e
+        last_end = e
 
-        valid_subs = [line for line in subs if line.strip()]
-        if not valid_subs:
-            self.log("-> No subtitle text to sync.")
-            return False
-        text_to_align = "\n".join(valid_subs)
+    # Pass 2: enforce non-decreasing starts with a minimum spacing so cues
+    # never overlap and each remains readable.
+    for i in range(1, n):
+        if starts[i] < starts[i - 1] + min_duration:
+            starts[i] = starts[i - 1] + min_duration
+        if ends[i] < starts[i] + min_duration:
+            ends[i] = starts[i] + min_duration
 
-        if is_cancelled():
-            return False
-        self.log(f"-> Syncing {len(valid_subs)} lines...")
+    # Pass 3: gap handling.
+    if fill_gaps:
+        for i in range(n - 1):
+            ends[i] = starts[i + 1]          # stay on screen until the next line
+        if audio_duration and ends[n - 1] < audio_duration:
+            ends[n - 1] = audio_duration     # last line runs to the end
+    else:
+        for i in range(n - 1):
+            if ends[i] > starts[i + 1]:
+                ends[i] = starts[i + 1]       # just trim any overlap
 
-        raw_times = self._aligned_line_times(
-            model, audio_source, valid_subs, text_to_align, detected_lang,
-            audio_duration, progress_callback,
-        )
-        if raw_times is None:
-            return False
-
-        cues = self._finalize_cues(
-            raw_times, audio_duration, unaligned_interval, min_duration, fill_gaps,
-        )
-
-        with srt_path.open("w", encoding="utf-8") as f:
-            for i, ((start_time, end_time), line_text) in enumerate(
-                zip(cues, valid_subs), 1
-            ):
-                f.write(
-                    f"{i}\n{format_time(start_time)} --> {format_time(end_time)}\n{line_text}\n\n"
-                )
-
-        self.log("-> Whisper sync successful! SRT saved.")
-        return True
-
-    def _aligned_line_times(
-        self, model, audio_source: str, valid_subs: Sequence[str],
-        text_to_align: str, detected_lang: str, audio_duration: float,
-        progress_callback: Optional[ProgressFn],
-    ) -> Optional[List[Tuple[Optional[float], Optional[float]]]]:
-        """Return a (start, end) per line; ``(None, None)`` marks an unaligned line.
-
-        Prefers ``original_split`` (one segment per input line); if that yields a
-        different segment count, falls back to the legacy char-count word mapping.
-        """
-        align_kwargs = {"original_split": True}
-        if progress_callback is not None:
-            align_kwargs["progress_callback"] = progress_callback
-        try:
-            result = model.align(audio_source, text_to_align, detected_lang, **align_kwargs)
-        except TypeError:
-            # Older stable-whisper without original_split/progress_callback kwargs.
-            result = model.align(audio_source, text_to_align, detected_lang)
-        except Exception:
-            logger.exception("stable-whisper align failed")
-            self.log("[!] Whisper alignment failed.")
-            return None
-        if result is None:
-            return None
-
-        segments = list(result.segments)
-        if len(segments) == len(valid_subs):
-            return [self._segment_times(s, audio_duration) for s in segments]
-
-        # Fallback: flatten words and re-map to lines by character count.
-        self.log(
-            f"-> Note: alignment produced {len(segments)} segments for "
-            f"{len(valid_subs)} lines; using word-level mapping."
-        )
-        all_words: List = []
-        for s in segments:
-            all_words.extend(getattr(s, "words", []) or [])
-        times: List[Tuple[Optional[float], Optional[float]]] = []
-        for words in self._map_words_to_lines(valid_subs, all_words):
-            aligned = [
-                w for w in words
-                if w.start != w.end and w.end < audio_duration - 0.05
-            ]
-            if aligned:
-                times.append((min(w.start for w in aligned), max(w.end for w in aligned)))
-            else:
-                times.append((None, None))
-        return times
-
-    @staticmethod
-    def _segment_times(seg, audio_duration: float) -> Tuple[Optional[float], Optional[float]]:
-        s = getattr(seg, "start", None)
-        e = getattr(seg, "end", None)
-        # Treat empty or end-clamped segments (speech ran past the audio) as
-        # unaligned so they get fanned out instead of piling up at the very end.
-        if s is None or e is None or e <= s or s >= audio_duration - 0.05:
-            return (None, None)
-        return (float(s), float(e))
-
-    @staticmethod
-    def _finalize_cues(
-        raw_times: Sequence[Tuple[Optional[float], Optional[float]]],
-        audio_duration: float,
-        unaligned_interval: float,
-        min_duration: float,
-        fill_gaps: bool,
-    ) -> List[Tuple[float, float]]:
-        """Turn raw per-line times into clean, ordered, non-overlapping cues."""
-        n = len(raw_times)
-        starts: List[float] = [0.0] * n
-        ends: List[float] = [0.0] * n
-
-        # Pass 1: fill in unaligned lines sequentially; clamp to valid ranges.
-        last_end = 0.0
-        for i, (s, e) in enumerate(raw_times):
-            if s is None or e is None:
-                s = last_end
-                e = s + unaligned_interval
-            s = max(0.0, s)
-            e = max(e, s + min_duration)
-            starts[i], ends[i] = s, e
-            last_end = e
-
-        # Pass 2: enforce non-decreasing starts with a minimum spacing so cues
-        # never overlap and each remains readable.
-        for i in range(1, n):
-            if starts[i] < starts[i - 1] + min_duration:
-                starts[i] = starts[i - 1] + min_duration
-            if ends[i] < starts[i] + min_duration:
-                ends[i] = starts[i] + min_duration
-
-        # Pass 3: gap handling.
-        if fill_gaps:
-            for i in range(n - 1):
-                ends[i] = starts[i + 1]          # stay on screen until the next line
-            if audio_duration and ends[n - 1] < audio_duration:
-                ends[n - 1] = audio_duration     # last line runs to the end
-        else:
-            for i in range(n - 1):
-                if ends[i] > starts[i + 1]:
-                    ends[i] = starts[i + 1]       # just trim any overlap
-
-        return list(zip(starts, ends))
-
-    def transcribe_segments(
-        self,
-        audio_source: str,
-        is_cancelled: CancelFn = lambda: False,
-        language: Optional[str] = None,
-        progress_callback: Optional[ProgressFn] = None,
-    ) -> List[Tuple[float, float, str]]:
-        """Transcribe and return ``(start, end, text)`` per segment — the timed
-        transcript used to pick highlight clips and to burn per-clip captions."""
-        if is_cancelled():
-            return []
-        model = self._ensure_model()
-        if is_cancelled():
-            return []
-        self.log("-> Transcribing audio (timed transcript)...")
-        kwargs = {}
-        if language:
-            kwargs["language"] = language
-        if progress_callback is not None:
-            kwargs["progress_callback"] = progress_callback
-        result = model.transcribe(audio_source, **kwargs)
-        out: List[Tuple[float, float, str]] = []
-        for s in result.segments:
-            text = (s.text or "").strip()
-            if text and s.end > s.start:
-                out.append((float(s.start), float(s.end), text))
-        return out
-
-    def transcribe_to_srt(
-        self,
-        audio_source: str,
-        srt_path: Path,
-        is_cancelled: CancelFn = lambda: False,
-        language: Optional[str] = None,
-        fill_gaps: bool = True,
-        min_duration: float = 0.3,
-        progress_callback: Optional[ProgressFn] = None,
-    ) -> bool:
-        """Transcribe ``audio_source`` from scratch and write a timed ``.srt``.
-
-        Unlike :meth:`align` (which re-times existing text), this creates captions
-        when there is no subtitle yet — Whisper supplies both the text and the
-        timestamps. ``fill_gaps`` keeps each caption on screen until the next.
-        """
-        if is_cancelled():
-            return False
-        model = self._ensure_model()
-        if is_cancelled():
-            return False
-
-        self.log("-> Transcribing audio for captions...")
-        kwargs = {}
-        if language:
-            kwargs["language"] = language
-        if progress_callback is not None:
-            kwargs["progress_callback"] = progress_callback
-        result = model.transcribe(audio_source, **kwargs)
-        if is_cancelled():
-            return False
-
-        segments = [s for s in result.segments if (s.text or "").strip()]
-        if not segments:
-            self.log("-> No speech detected; no captions written.")
-            return False
-
-        audio = self._whisper.load_audio(audio_source)
-        audio_duration = audio.shape[0] / float(WHISPER_SAMPLE_RATE)
-
-        raw_times = [(s.start, s.end) for s in segments]
-        texts = [s.text.strip() for s in segments]
-        cues = self._finalize_cues(
-            raw_times, audio_duration, UNALIGNED_INTERVAL, min_duration, fill_gaps,
-        )
-
-        with srt_path.open("w", encoding="utf-8") as f:
-            for i, ((start_time, end_time), text) in enumerate(zip(cues, texts), 1):
-                f.write(
-                    f"{i}\n{format_time(start_time)} --> {format_time(end_time)}\n{text}\n\n"
-                )
-        self.log(f"-> Captions written: {Path(srt_path).name}")
-        return True
-
-    @staticmethod
-    def _map_words_to_lines(valid_subs: Sequence[str], all_words: List) -> List[List]:
-        """Walk the flat word list once, distributing words to lines by char count."""
-        mapping: List[List] = []
-        word_idx = 0
-        for line in valid_subs:
-            target_len = len(line.replace(" ", "").replace("\n", ""))
-            chars = 0
-            words: List = []
-            while chars < target_len and word_idx < len(all_words):
-                w = all_words[word_idx]
-                chars += len(w.word.replace(" ", ""))
-                words.append(w)
-                word_idx += 1
-            mapping.append(words)
-        return mapping
+    return list(zip(starts, ends))
 
 
 class GroqTranscriber:
@@ -764,6 +513,221 @@ class GroqTranscriber:
             raise RuntimeError(f"curl returned no HTTP status (got {code_str!r})")
         return _Resp(status, body)
 
+    def _sdk_call(self, temp_audio: str, response_format: str,
+                  language: Optional[str] = None,
+                  granularities: Optional[Sequence[str]] = None):
+        """One Groq SDK transcription call over an httpx client that honours our
+        proxy/trust_env. Returns the SDK response (a ``str`` for 'text', or an
+        object exposing ``.text``/``.segments``/``.words`` for 'verbose_json').
+        Returns ``None`` only when the ``groq`` SDK isn't importable; a real
+        API/transport error propagates to the caller.
+
+        The SDK's httpx/HTTP-2 handshake is accepted by Cloudflare in regions
+        where our ``requests``/``curl`` fingerprint is reset."""
+        try:
+            from groq import Groq
+            import httpx
+        except ImportError:
+            return None
+        with open(temp_audio, "rb") as f:
+            payload = f.read()
+        # Explicit proxy URL wins; otherwise trust_env lets httpx read the env.
+        http_client = httpx.Client(
+            proxy=self.proxy or None, trust_env=self.trust_env, timeout=180.0,
+        )
+        try:
+            client = Groq(api_key=self.api_key, http_client=http_client, max_retries=2)
+            kwargs = {
+                "file": (os.path.basename(temp_audio), payload),
+                "model": "whisper-large-v3",
+                "temperature": 0,
+                "response_format": response_format,
+            }
+            if language:
+                kwargs["language"] = language
+            if granularities:
+                kwargs["timestamp_granularities"] = list(granularities)
+            return client.audio.transcriptions.create(**kwargs)
+        finally:
+            http_client.close()
+
+    def _transcribe_via_sdk(self, temp_audio: str,
+                            language: Optional[str]) -> Optional[str]:
+        """Text transcript via the SDK. Returns the text, or ``None`` if the SDK
+        isn't importable so the caller can fall back to the curl/requests path."""
+        resp = self._sdk_call(temp_audio, "text", language=language)
+        if resp is None:
+            return None
+        if isinstance(resp, str):
+            return resp
+        return getattr(resp, "text", str(resp))
+
+    def _prepare_audio(self, audio_path: str,
+                       is_cancelled: CancelFn) -> Optional[str]:
+        """Downmix/compress to a small mono 16k mp3 for a fast, reliable upload.
+        Returns the temp path (caller deletes) or ``None`` on cancel/ffmpeg
+        failure."""
+        if is_cancelled():
+            return None
+        self.log("-> Preparing audio for Groq AI upload...")
+        temp_audio = str(Path(audio_path).with_suffix(".tmp.mp3"))
+        cmd = [
+            _ffmpeg_exe(), "-y", "-i", audio_path,
+            "-vn", "-map_metadata", "-1", "-ac", "1", "-ar", "16000", "-b:a", "32k",
+            temp_audio,
+        ]
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        try:
+            subprocess.run(cmd, capture_output=True, check=True, creationflags=creationflags)
+        except (subprocess.CalledProcessError, OSError) as e:
+            self.log(f"[!] ffmpeg failed preparing audio: {e}")
+            return None
+        return temp_audio
+
+    def align(
+        self,
+        audio_source: str,
+        subs: Sequence[str],
+        srt_path: Path,
+        is_cancelled: CancelFn = lambda: False,
+        unaligned_interval: float = UNALIGNED_INTERVAL,
+        progress_callback: Optional[ProgressFn] = None,
+        fill_gaps: bool = True,
+        min_duration: float = 0.3,
+    ) -> bool:
+        """Re-time existing subtitle lines against the audio and write an SRT.
+
+        Groq has no forced-alignment mode, so we transcribe the audio with
+        word-level timestamps and distribute those words across the given lines
+        by character count (the same mapping the local aligner used as a
+        fallback). ``fill_gaps`` keeps each line on screen until the next."""
+        if not self.api_key:
+            self.log("[!] Error: Groq API Key is missing in settings.")
+            return False
+        valid_subs = [ln for ln in subs if ln.strip()]
+        if not valid_subs:
+            self.log("-> No subtitle text to sync.")
+            return False
+        temp = self._prepare_audio(audio_source, is_cancelled)
+        if not temp:
+            return False
+        try:
+            if is_cancelled():
+                return False
+            self.log(f"-> Syncing {len(valid_subs)} lines with Groq (whisper-large-v3)...")
+            resp = self._sdk_call(temp, "verbose_json", granularities=["word", "segment"])
+            if resp is None:
+                self.log("[!] Groq SDK not available for alignment.")
+                return False
+            words = _as_words(resp)
+            if not words:
+                self.log("-> Groq returned no word timestamps; cannot sync.")
+                return False
+            audio_duration = float(_get(resp, "duration", 0.0) or 0.0)
+            raw_times: List[Tuple[Optional[float], Optional[float]]] = []
+            for wl in _map_words_to_lines(valid_subs, words):
+                aligned = [w for w in wl if w.end > w.start]
+                if aligned:
+                    raw_times.append((min(w.start for w in aligned),
+                                      max(w.end for w in aligned)))
+                else:
+                    raw_times.append((None, None))
+            cues = _finalize_cues(raw_times, audio_duration, unaligned_interval,
+                                  min_duration, fill_gaps)
+            with open(srt_path, "w", encoding="utf-8") as f:
+                for i, ((s, e), line) in enumerate(zip(cues, valid_subs), 1):
+                    f.write(f"{i}\n{format_time(s)} --> {format_time(e)}\n{line}\n\n")
+            self.log("-> Groq sync successful! SRT saved.")
+            return True
+        except Exception as e:
+            self.log(f"[!] Groq alignment failed: {e}")
+            logger.exception("Groq align failed for %s", audio_source)
+            return False
+        finally:
+            _safe_remove(temp)
+
+    def transcribe_to_srt(
+        self,
+        audio_source: str,
+        srt_path: Path,
+        is_cancelled: CancelFn = lambda: False,
+        language: Optional[str] = None,
+        fill_gaps: bool = True,
+        min_duration: float = 0.3,
+        progress_callback: Optional[ProgressFn] = None,
+    ) -> bool:
+        """Transcribe from scratch and write a timed SRT (captions), using Groq
+        segment timestamps. ``fill_gaps`` keeps each caption on screen until the
+        next one starts."""
+        if not self.api_key:
+            self.log("[!] Error: Groq API Key is missing in settings.")
+            return False
+        temp = self._prepare_audio(audio_source, is_cancelled)
+        if not temp:
+            return False
+        try:
+            if is_cancelled():
+                return False
+            self.log("-> Transcribing audio for captions (Groq)...")
+            resp = self._sdk_call(temp, "verbose_json", language=language,
+                                  granularities=["segment"])
+            if resp is None:
+                self.log("[!] Groq SDK not available for captions.")
+                return False
+            segs = [s for s in _as_segments(resp) if s.text.strip() and s.end > s.start]
+            if not segs:
+                self.log("-> No speech detected; no captions written.")
+                return False
+            audio_duration = float(_get(resp, "duration", 0.0) or 0.0)
+            raw_times = [(s.start, s.end) for s in segs]
+            texts = [s.text.strip() for s in segs]
+            cues = _finalize_cues(raw_times, audio_duration, UNALIGNED_INTERVAL,
+                                  min_duration, fill_gaps)
+            with open(srt_path, "w", encoding="utf-8") as f:
+                for i, ((s, e), text) in enumerate(zip(cues, texts), 1):
+                    f.write(f"{i}\n{format_time(s)} --> {format_time(e)}\n{text}\n\n")
+            self.log(f"-> Captions written: {Path(srt_path).name}")
+            return True
+        except Exception as e:
+            self.log(f"[!] Groq captioning failed: {e}")
+            logger.exception("Groq transcribe_to_srt failed for %s", audio_source)
+            return False
+        finally:
+            _safe_remove(temp)
+
+    def transcribe_segments(
+        self,
+        audio_source: str,
+        is_cancelled: CancelFn = lambda: False,
+        language: Optional[str] = None,
+        progress_callback: Optional[ProgressFn] = None,
+    ) -> List[Tuple[float, float, str]]:
+        """Return ``(start, end, text)`` per segment — the timed transcript used
+        to pick highlight clips and burn per-clip captions."""
+        if not self.api_key:
+            self.log("[!] Error: Groq API Key is missing in settings.")
+            return []
+        temp = self._prepare_audio(audio_source, is_cancelled)
+        if not temp:
+            return []
+        try:
+            if is_cancelled():
+                return []
+            self.log("-> Transcribing audio (timed transcript, Groq)...")
+            resp = self._sdk_call(temp, "verbose_json", language=language,
+                                  granularities=["segment"])
+            if resp is None:
+                self.log("[!] Groq SDK not available.")
+                return []
+            return [(s.start, s.end, s.text.strip()) for s in _as_segments(resp)
+                    if s.text.strip() and s.end > s.start]
+        except Exception as e:
+            self.log(f"[!] Groq transcript failed: {e}")
+            logger.exception("Groq transcribe_segments failed for %s", audio_source)
+            return []
+        finally:
+            _safe_remove(temp)
+
     def transcribe_to_text(
         self,
         audio_path: str,
@@ -775,20 +739,10 @@ class GroqTranscriber:
             self.log("[!] Error: Groq API Key is missing in settings.")
             return None
 
-        if is_cancelled():
+        temp_audio = self._prepare_audio(audio_path, is_cancelled)
+        if not temp_audio:
             return None
-        self.log("-> Preparing audio for Groq AI upload...")
-
-        temp_audio = str(Path(audio_path).with_suffix(".tmp.mp3"))
         try:
-            cmd = [
-                _ffmpeg_exe(), "-y", "-i", audio_path,
-                "-vn", "-map_metadata", "-1", "-ac", "1", "-ar", "16000", "-b:a", "32k",
-                temp_audio
-            ]
-            creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-            subprocess.run(cmd, capture_output=True, check=True, creationflags=creationflags)
-
             if is_cancelled():
                 return None
             self.log("-> Uploading to Groq AI (Whisper-large-v3)...")
@@ -796,32 +750,32 @@ class GroqTranscriber:
             if progress_callback:
                 progress_callback(50, 100) # Mock 50% for upload started
 
-            data = {
-                "model": "whisper-large-v3",
-                "response_format": "text"
-            }
-            if language:
-                data["language"] = language
-
-            response = self._upload(temp_audio, data)
-
-            if response.status_code != 200:
-                self.log(f"[!] Groq API Error: {response.status_code} - {response.text}")
-                logger.error("Groq API error %s: %s", response.status_code, response.text)
-                return None
+            # Prefer the official groq SDK (httpx / HTTP-2 transport). Cloudflare
+            # accepts its TLS fingerprint, where our hand-rolled requests/curl
+            # path gets reset ('SSL: UNEXPECTED_EOF' / schannel handshake). The
+            # SDK returns None only when it isn't importable, so we can fall back
+            # to the curl/requests uploader in that one case; a real API error
+            # from the SDK propagates and is handled by the outer except.
+            text = self._transcribe_via_sdk(temp_audio, language)
+            if text is None:
+                data = {"model": "whisper-large-v3", "response_format": "text"}
+                if language:
+                    data["language"] = language
+                response = self._upload(temp_audio, data)
+                if response.status_code != 200:
+                    self.log(f"[!] Groq API Error: {response.status_code} - {response.text}")
+                    logger.error("Groq API error %s: %s", response.status_code, response.text)
+                    return None
+                text = response.text
 
             if progress_callback:
                 progress_callback(100, 100) # Mock 100% for completed
 
             self.log("-> Groq transcription successful!")
-            return response.text
+            return text
         except Exception as e:
             self.log(f"[!] Error during Groq transcription: {e}")
             logger.exception("Groq transcription failed for %s", audio_path)
             return None
         finally:
-            if os.path.exists(temp_audio):
-                try:
-                    os.remove(temp_audio)
-                except OSError:
-                    pass
+            _safe_remove(temp_audio)

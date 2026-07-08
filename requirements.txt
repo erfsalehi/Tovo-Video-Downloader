@@ -1,22 +1,19 @@
 # Core downloader
 yt-dlp>=2024.8.6
 
-# Whisper AI smart-sync (optional but recommended).
-# Loaded lazily; downloads will still work without it.
-stable-ts>=2.17.0
-
-# Torch is installed separately on Windows by Start.bat (CPU-only build, ~200MB).
-# On Linux/macOS, install manually if you want Whisper sync:
-#   pip install torch torchaudio
-# torch>=2.0.0
-# torchaudio>=2.0.0
-
 # Optional: explicit certificate bundle for SSL verification.
 # Recommended on locked-down corporate networks.
 # certifi
 
-# Network requests for Groq API
+# Network requests (curl/requests fallback path + shared HTTP)
 requests>=2.31.0
+
+# Groq cloud Whisper — official SDK (httpx/HTTP-2 transport). Preferred over the
+# raw requests/curl upload because Cloudflare accepts its TLS fingerprint in
+# regions where requests gets reset ('SSL: UNEXPECTED_EOF'). httpx ships with it
+# but is listed since we build the proxy-aware client directly.
+groq>=1.0.0
+httpx>=0.27.0
 
 # Short Clips: rounded-pill burned captions with correct Persian/Arabic shaping.
 # Pillow renders the caption images; the other two shape + reorder RTL text.

@@ -22,7 +22,7 @@ from config import Config
 from dependencies import find_missing_tools, install_all, update_yt_dlp
 import requests
 from subtitles import (
-    WhisperAligner, GroqTranscriber, generate_standard_srt, read_srt_cues,
+    GroqTranscriber, generate_standard_srt, read_srt_cues,
     CaptionStyle, write_ttml,
 )
 from widgets import DownloadManager, RoundedButton, RoundedEntry, ModernCheckbutton, RoundedFrame
@@ -1212,10 +1212,10 @@ class AppleStyleApp:
         if self.vo_manager:
             self.root.after(0, self.vo_manager.set_item_status, index, text, color)
 
-    def _make_sync_aligner(self) -> Optional[WhisperAligner]:
-        """Create the alignment model for Sync, honouring the chosen model size."""
-        model_name = self.sync_model_var.get() if hasattr(self, "sync_model_var") else "small"
-        return WhisperAligner.try_create(self.log, model_name=model_name)
+    def _make_sync_aligner(self) -> GroqTranscriber:
+        """Return the Groq transcriber used to align/caption. Groq only powers
+        every Whisper-backed feature now (Sync, Captions, Shorts)."""
+        return self._make_groq_transcriber()
 
     def _make_groq_transcriber(self) -> GroqTranscriber:
         """Build a GroqTranscriber. Groq needs the system/VPN proxy in regions
@@ -1225,14 +1225,6 @@ class AppleStyleApp:
         here."""
         return GroqTranscriber(self.log, self.groq_key_var.get(),
                                proxy=self.proxy_url_var.get().strip())
-
-    def _vo_local_fallback(self) -> Optional[WhisperAligner]:
-        """Lazily create (once) a local Whisper model used as an offline fallback
-        when Groq is unreachable."""
-        if getattr(self, "_vo_local_aligner", None) is None:
-            self.log("-> Loading local Whisper (offline fallback)…")
-            self._vo_local_aligner = WhisperAligner.try_create(self.log)
-        return self._vo_local_aligner
 
     def _try_transcribe(self, transcriber, audio_path: str, name: str,
                         attempts: int) -> Optional[str]:
@@ -1251,31 +1243,11 @@ class AppleStyleApp:
 
     def _vo_transcribe_title(self, primary, audio_path: str, name: str,
                              attempts: int = 3) -> Optional[str]:
-        """Transcribe the title (forced English). Tries the primary provider with
-        retries; if Groq is unreachable, falls back to a local Whisper model and
-        skips Groq for the rest of the batch so we don't hammer a dead endpoint."""
-        groq_primary = isinstance(primary, GroqTranscriber)
-        local_only = groq_primary and getattr(self, "_vo_groq_dead", False)
-
-        if not local_only:
-            text = self._try_transcribe(primary, audio_path, name, attempts)
-            if text:
-                return text
-            if not groq_primary:
-                return None  # local was already the primary; nothing else to try
-
-        local = self._vo_local_fallback()
-        if local is None:
-            self.log("[!] Local Whisper fallback unavailable (Whisper not installed).")
-            return None
-        if not local_only:
-            self.log("-> Groq unreachable; using local Whisper for the rest of this batch.")
-            self._vo_groq_dead = True
-        return self._try_transcribe(local, audio_path, name, attempts=1)
+        """Transcribe the title (forced English) via Groq, with retries."""
+        return self._try_transcribe(primary, audio_path, name, attempts)
 
     def _voiceover_worker(self, specs: List[Dict]) -> None:
         self.log(f"\n--- Starting Voiceover ({len(specs)} clips) ---")
-        self._vo_groq_dead = False  # retry Groq fresh each run (VPN may be back up)
         rvc_dir = Path(self.rvc_dir)
         ffmpeg = str(BASE_PATH / "ffmpeg.exe")
         dub_dir = Path(self.dub_dir)
@@ -1285,15 +1257,7 @@ class AppleStyleApp:
         # clips keep their filename, so an all-"pat long" batch needs none.
         transcriber = None
         if any(not s.get("keep_title") for s in specs):
-            provider = self.trans_provider_var.get()
-            if provider == "Groq AI (Fastest)":
-                transcriber = self._make_groq_transcriber()
-            else:
-                transcriber = WhisperAligner.try_create(self.log)
-            if not transcriber:
-                self.log("[!] Voiceover: failed to initialize transcription provider.")
-                self.root.after(0, self.reset_ui)
-                return
+            transcriber = self._make_groq_transcriber()
 
         device, is_half = voiceover.resolve_device(rvc_dir, self.config.get("rvc_device", "Auto"))
         self.log(f"-> RVC device: {device} (half precision: {is_half})")
@@ -1631,9 +1595,9 @@ class AppleStyleApp:
 
     def _caption_worker(self, items: List[Path]) -> None:
         self.log(f"\n--- Starting Auto-Caption ({len(items)} file(s)) ---")
-        aligner = WhisperAligner.try_create(self.log, model_name=self.caption_model_var.get())
-        if aligner is None:
-            self.log("[!] Captions: local Whisper is not available (install Whisper deps).")
+        aligner = self._make_groq_transcriber()
+        if not self.groq_key_var.get().strip():
+            self.log("[!] Captions: set your Groq API key on the Transcription tab first.")
             self.root.after(0, self.reset_ui)
             return
 
@@ -1890,9 +1854,9 @@ class AppleStyleApp:
     def _shorts_analyze_worker(self, video: str) -> None:
         try:
             self.log("\n--- Analyzing video for short clips ---")
-            aligner = WhisperAligner.try_create(self.log, model_name=self.shorts_wmodel_var.get())
-            if aligner is None:
-                self.log("[!] Shorts: local Whisper unavailable (install Whisper deps).")
+            aligner = self._make_groq_transcriber()
+            if not self.groq_key_var.get().strip():
+                self.log("[!] Shorts: set your Groq API key on the Transcription tab first.")
                 return
             lang = {"Persian": "fa", "English": "en"}.get(self.shorts_lang_var.get())
             segs = aligner.transcribe_segments(
@@ -2043,16 +2007,13 @@ class AppleStyleApp:
 
     def _build_transcription_settings(self, parent: tk.Frame) -> None:
         tk.Label(
-            parent, text="Transcription Provider:", bg=self.bg_color, fg=self.text_color,
-            font=(self.font_family, 11, "bold"),
+            parent, text="Transcription: Groq (whisper-large-v3)", bg=self.bg_color,
+            fg=self.text_color, font=(self.font_family, 11, "bold"),
         ).pack(side=tk.LEFT, padx=(0, 10))
 
-        self.trans_provider_var = tk.StringVar(value=self.config.get("transcription_provider", "Local Whisper"))
-        ttk.Combobox(
-            parent, textvariable=self.trans_provider_var,
-            values=["Local Whisper", "Groq AI (Fastest)"],
-            state="readonly", font=(self.font_family, 10), width=20,
-        ).pack(side=tk.LEFT)
+        # Groq powers every transcription/alignment feature now; kept as a fixed
+        # value so the rest of the code (and config save) still has a provider.
+        self.trans_provider_var = tk.StringVar(value="Groq AI (Fastest)")
 
         tk.Label(
             parent, text="Groq Key:", bg=self.bg_color, fg=self.text_color,
@@ -2418,9 +2379,7 @@ class AppleStyleApp:
         menubar.add_cascade(label="Tools", menu=tools_menu)
         tools_menu.add_command(label="Force Update yt-dlp & FFmpeg", command=lambda: threading.Thread(target=self._download_tools_thread, kwargs={"force_update": True}, daemon=True).start())
         tools_menu.add_command(label="Clear local cookies.txt", command=self.clear_local_cookies)
-        tools_menu.add_command(label="Re-download Whisper models (clear cache)",
-                               command=self.clear_whisper_cache)
-        
+
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help", menu=help_menu)
         help_menu.add_command(label="About", command=lambda: messagebox.showinfo("About", "Tovo Video Downloader v2.1\nA professional batch video & transcription tool."))
@@ -2450,38 +2409,6 @@ class AppleStyleApp:
             self.log("-> Removed local cookies.txt")
         except OSError as e:
             self.log(f"-> Error removing cookies: {e}")
-
-    def clear_whisper_cache(self) -> None:
-        """Delete cached Whisper model files so they re-download cleanly next time.
-        Fixes the 'SHA256 checksum does not match' error from an interrupted download."""
-        root = os.getenv("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
-        cache_dir = Path(root) / "whisper"
-        models = sorted(cache_dir.glob("*.pt")) if cache_dir.is_dir() else []
-        if not models:
-            messagebox.showinfo(
-                "Whisper Models",
-                f"No cached Whisper models found in:\n{cache_dir}\n\n"
-                "They'll be downloaded automatically next time you Sync, "
-                "Caption, or make Shorts.",
-            )
-            return
-        names = ", ".join(m.stem for m in models)
-        if not messagebox.askyesno(
-            "Re-download Whisper Models",
-            f"Delete {len(models)} cached Whisper model(s) ({names})?\n\n"
-            "They'll re-download automatically the next time they're needed. "
-            "Use this if a download was interrupted and you get a checksum error.",
-        ):
-            return
-        removed = 0
-        for m in models:
-            try:
-                m.unlink()
-                removed += 1
-            except OSError as e:
-                self.log(f"[!] Could not delete {m}: {e}")
-        self.log(f"-> Cleared {removed} Whisper model(s) from {cache_dir}. "
-                 "They'll re-download when next needed.")
 
     # ------------------------------------------------------------------
     # Logging
@@ -2682,7 +2609,7 @@ class AppleStyleApp:
 
         def _worker():
             self.log(f"-> Manual retry started for item {index + 1}...")
-            aligner: Optional[WhisperAligner] = None
+            aligner: Optional[GroqTranscriber] = None
             if sync_mode == "Whisper AI (Smart Sync)":
                 aligner = self._make_sync_aligner()
 
@@ -2980,7 +2907,7 @@ class AppleStyleApp:
         title: str,
         link: str,
         subs: Sequence[str],
-        aligner: Optional[WhisperAligner],
+        aligner: Optional[GroqTranscriber],
         is_retry: bool = False,
     ) -> bool:
         """Worker function for a single item download. Returns True if successful."""
@@ -3040,10 +2967,12 @@ class AppleStyleApp:
         subtitles_list: Sequence[Sequence[str]],
         sync_mode: str,
     ) -> None:
-        aligner: Optional[WhisperAligner] = None
+        aligner: Optional[GroqTranscriber] = None
         if sync_mode == "Whisper AI (Smart Sync)":
-            aligner = self._make_sync_aligner()
-            if aligner is None:
+            if self.groq_key_var.get().strip():
+                aligner = self._make_sync_aligner()
+            else:
+                self.log("[!] Smart Sync needs a Groq API key; using 2-second intervals.")
                 sync_mode = "None (2-second intervals)"
 
         try:
@@ -3146,7 +3075,7 @@ class AppleStyleApp:
         self,
         title: str,
         subs: Sequence[str],
-        aligner: Optional[WhisperAligner],
+        aligner: Optional[GroqTranscriber],
     ) -> None:
         if not subs:
             return
@@ -3441,11 +3370,11 @@ class AppleStyleApp:
 
     def _sync_process(self, chosen: List[dict]) -> None:
         self.log(f"\n--- Starting Subtitle Sync ({len(chosen)} item(s)) ---")
-        aligner = self._make_sync_aligner()
-        if aligner is None:
-            self.log("[!] Whisper is not available; cannot sync. Install the Whisper dependencies.")
+        if not self.groq_key_var.get().strip():
+            self.log("[!] Sync needs a Groq API key (set it on the Transcription tab).")
             self.root.after(0, self.reset_ui)
             return
+        aligner = self._make_sync_aligner()
 
         try:
             for index, item in enumerate(chosen):
@@ -3475,7 +3404,7 @@ class AppleStyleApp:
                 self.log("\nSync cancelled by user.")
                 self.root.after(0, self.reset_ui)
 
-    def _sync_item_worker(self, index: int, item: dict, aligner: WhisperAligner, is_retry: bool = False) -> bool:
+    def _sync_item_worker(self, index: int, item: dict, aligner: GroqTranscriber, is_retry: bool = False) -> bool:
         if self._is_cancelled() or index in self.cancelled_indices:
             return False
 
@@ -3537,11 +3466,11 @@ class AppleStyleApp:
         item = self._sync_chosen[index]
 
         def _worker():
-            aligner = self._make_sync_aligner()
-            if aligner is None:
+            if not self.groq_key_var.get().strip():
                 if self.sync_manager:
-                    self.root.after(0, self.sync_manager.set_item_status, index, "Failed (AI Init)", "#FF3B30")
+                    self.root.after(0, self.sync_manager.set_item_status, index, "Failed (No Groq key)", "#FF3B30")
                 return
+            aligner = self._make_sync_aligner()
             self._sync_item_worker(index, item, aligner, is_retry=True)
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -3629,13 +3558,8 @@ class AppleStyleApp:
         title, link = self._trans_batch_items[index]
         
         def _worker():
-            # Create a dedicated aligner/transcriber for the retry
-            provider = self.trans_provider_var.get()
-            transcriber = None
-            if provider == "Groq AI (Fastest)":
-                transcriber = self._make_groq_transcriber()
-            else:
-                transcriber = WhisperAligner.try_create(self.log)
+            # Groq powers transcription; build a dedicated transcriber for the retry.
+            transcriber = self._make_groq_transcriber()
 
             if not transcriber:
                 self.root.after(0, self.trans_manager.set_item_status, index, "Failed (AI Init)", "#FF3B30")
@@ -3724,23 +3648,17 @@ class AppleStyleApp:
             try: report_path.unlink()
             except: pass
 
-        self._trans_batch_items = list(zip(titles, links)) 
-        
-        provider = self.trans_provider_var.get()
+        self._trans_batch_items = list(zip(titles, links))
+
         concurrent_mode = self.trans_concurrent_var.get()
         max_workers = self.trans_max_concurrent_var.get() if concurrent_mode else 1
-        
+
         all_results = [None] * len(titles) # Use fixed size for order
         results_lock = threading.Lock()
-        
-        transcriber = None
-        if provider == "Groq AI (Fastest)":
-            transcriber = self._make_groq_transcriber()
-        else:
-            transcriber = WhisperAligner.try_create(self.log)
 
-        if not transcriber:
-            self.log("[!] Failed to initialize transcription provider.")
+        transcriber = self._make_groq_transcriber()
+        if not self.groq_key_var.get().strip():
+            self.log("[!] Transcription: set your Groq API key first.")
             self.root.after(0, self.reset_ui)
             return
 
