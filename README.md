@@ -66,8 +66,8 @@ Both cloud services (Groq and OpenRouter) sit behind Cloudflare, which can reset
 
 **Clone the repo:**
 ```bash
-git clone https://github.com/erfsalehi/Tovo-Video-Downloader.git
-cd Tovo-Video-Downloader
+git clone https://github.com/erfsalehi/Tovo-Content-Localization.git
+cd Tovo-Content-Localization
 ```
 
 **Run it:**
