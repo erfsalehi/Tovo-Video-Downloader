@@ -68,8 +68,12 @@ class Config:
         self.x_pad, self.x_query, self.x_center, self.x_max = self.device_config()
 
     def device_config(self):
-        if torch.cuda.is_available():
-            i_device = int(self.device.split(":")[-1])
+        # Branch on the *requested* device, not global CUDA availability: the
+        # user can force "cpu" on a CUDA-capable machine, in which case
+        # int("cpu".split(":")[-1]) used to blow up here. Only take the GPU path
+        # for an actual "cuda[:N]" device that torch can see.
+        if self.device.startswith("cuda") and torch.cuda.is_available():
+            i_device = int(self.device.split(":")[-1]) if ":" in self.device else 0
             self.gpu_name = torch.cuda.get_device_name(i_device)
             if (
                 ("16" in self.gpu_name and "V100" not in self.gpu_name.upper())
@@ -84,11 +88,11 @@ class Config:
                 torch.cuda.get_device_properties(i_device).total_memory
                 / 1024 / 1024 / 1024 + 0.4
             )
-        elif torch.backends.mps.is_available():
-            print("No supported NVIDIA GPU found, using MPS")
-            self.device = "mps"
+        elif self.device == "mps" and torch.backends.mps.is_available():
+            print("Using MPS")
         else:
-            print("No supported NVIDIA GPU found, using CPU")
+            # Explicit CPU request, or a cuda device torch can't actually see.
+            print("Using CPU")
             self.device = "cpu"
             self.is_half = False
 
