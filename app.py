@@ -1560,7 +1560,12 @@ class AppleStyleApp:
             self.reset_ui()
             return
         if self.downloading:
-            return
+            if self._review_state_active():
+                self.reset_ui()
+            else:
+                self.log("[!] Captions: another job is still running — cancel it "
+                         "or let it finish before starting captions.")
+                return
         if not self._caption_items:
             self.log("[!] Captions: nothing to caption — pick a folder and Rescan.")
             return
@@ -1839,7 +1844,12 @@ class AppleStyleApp:
 
     def start_shorts_analyze(self) -> None:
         if self.downloading:
-            return
+            if self._review_state_active():
+                self.reset_ui()
+            else:
+                self.log("[!] Shorts: another job is still running — cancel it "
+                         "or let it finish before analyzing.")
+                return
         if not self.shorts_video or not Path(self.shorts_video).is_file():
             self.log("[!] Shorts: pick a video first.")
             return
@@ -1898,7 +1908,12 @@ class AppleStyleApp:
 
     def start_shorts_render(self) -> None:
         if self.downloading:
-            return
+            if self._review_state_active():
+                self.reset_ui()
+            else:
+                self.log("[!] Shorts: another job is still running — cancel it "
+                         "or let it finish before rendering.")
+                return
         if not self._shorts_clips:
             self.log("[!] Shorts: analyze a video first.")
             return
@@ -2642,9 +2657,18 @@ class AppleStyleApp:
         if self.downloading and self.download_btn.text == "Finish & Return":
             self.reset_ui()
             return
-        # Otherwise ignore clicks while a batch is actively running.
         if self.downloading:
-            return
+            # Another tab may be parked in its own "Finish & Return" review
+            # state (e.g. a finished transcription batch), which keeps the
+            # shared `downloading` flag True with no job actually running.
+            # Clear that stale review and continue; only block a genuinely
+            # active job.
+            if self._review_state_active():
+                self.reset_ui()
+            else:
+                self.log("[!] Download: another job is still running — cancel it "
+                         "or let it finish before starting a new batch.")
+                return
 
         text = self.dl_input_text.get("1.0", tk.END).strip()
         lines = [line.strip() for line in text.split("\n") if line.strip()]
@@ -3322,7 +3346,12 @@ class AppleStyleApp:
             self.reset_ui()
             return
         if self.downloading:
-            return
+            if self._review_state_active():
+                self.reset_ui()
+            else:
+                self.log("[!] Sync: another job is still running — cancel it "
+                         "or let it finish before starting a sync.")
+                return
 
         if not self.sync_items:
             messagebox.showinfo("Sync", "No syncable items found. Add a .srt + its Dub/Video, then Rescan.")
@@ -3492,9 +3521,13 @@ class AppleStyleApp:
         if self.downloading and self.trans_btn.text == "Finish & Return":
             self.reset_ui()
             return
-        # Otherwise ignore clicks while a batch is actively running.
         if self.downloading:
-            return
+            if self._review_state_active():
+                self.reset_ui()
+            else:
+                self.log("[!] Transcription: another job is still running — cancel it "
+                         "or let it finish before starting a new batch.")
+                return
 
         text = self.trans_input_text.get("1.0", tk.END).strip()
         if not text:
