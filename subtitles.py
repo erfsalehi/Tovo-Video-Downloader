@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
+import difflib
 import json
 import logging
 import os
@@ -9,6 +10,7 @@ import re
 import requests
 import shutil
 import subprocess
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
@@ -376,6 +378,129 @@ def _as_segments(resp) -> List[_Seg]:
     return out
 
 
+# Character-level fuzzy matching, used to anchor subtitle lines onto Groq word
+# timestamps. Matching is done on a normalized, space-free character stream so
+# it survives the three ways a transcript diverges from the SRT text:
+#   - spelling wobble (اتوبوس/اوتوبوس, غول/قول) — most chars still match;
+#   - tokenization differences (هیچوقت vs هیچ وقت) — spaces are stripped;
+#   - digits vs spelled-out numbers (40 vs چهل) — those chars simply don't
+#     match, and the surrounding words still anchor the line.
+_MATCH_CHAR_MAP = str.maketrans({
+    "ي": "ی",  # Arabic yeh -> Farsi yeh
+    "ك": "ک",  # Arabic kaf -> Farsi kaf
+    "ة": "ه",  # teh marbuta -> heh
+    "أ": "ا", "إ": "ا", "آ": "ا",  # alef forms
+    "ؤ": "و",  # waw hamza
+    "ئ": "ی",  # yeh hamza
+})
+_DIACRITICS_RE = re.compile("[ً-ْٰـ]")  # Arabic harakat + tatweel
+_EASTERN_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
+
+def _norm_match_chars(text: str) -> List[str]:
+    """Reduce text to a normalized letters/digits-only character list."""
+    t = unicodedata.normalize("NFC", text)
+    t = t.translate(_EASTERN_DIGITS).translate(_MATCH_CHAR_MAP)
+    t = _DIACRITICS_RE.sub("", t).lower()
+    return [c for c in t if c.isalnum()]
+
+
+def _build_char_stream(units: Sequence[Tuple[str, int]]) -> Tuple[str, List[int]]:
+    """Concatenate normalized chars of ``(text, owner_idx)`` units, remembering
+    which unit each char came from."""
+    chars: List[str] = []
+    owners: List[int] = []
+    for text, idx in units:
+        for c in _norm_match_chars(text):
+            chars.append(c)
+            owners.append(idx)
+    return "".join(chars), owners
+
+
+def _match_lines_to_words(
+    valid_subs: Sequence[str],
+    words: List,
+    min_block: int = 3,
+    min_line_cov: float = 0.15,
+) -> List[Tuple[Optional[float], Optional[float]]]:
+    """Anchor each subtitle line to the transcript words that actually match it.
+
+    Runs a character-level SequenceMatcher between the transcript and the
+    subtitle text (both normalized and space-free), then times each line from
+    the words its matched characters belong to. Lines matching less than
+    ``min_line_cov`` of their characters return ``(None, None)`` — including
+    content the audio has but the SRT doesn't (e.g. a spoken intro title),
+    which simply matches nothing instead of shifting every following line."""
+    t_chars, t_owner = _build_char_stream([(w.word, i) for i, w in enumerate(words)])
+    s_chars, s_owner = _build_char_stream([(ln, i) for i, ln in enumerate(valid_subs)])
+    if not t_chars or not s_chars:
+        return [(None, None)] * len(valid_subs)
+    sm = difflib.SequenceMatcher(None, t_chars, s_chars, autojunk=False)
+
+    n = len(valid_subs)
+    line_times: List[List[Tuple[float, float]]] = [[] for _ in range(n)]
+    matched = [0] * n
+    total = [0] * n
+    for c in s_owner:
+        total[c] += 1
+    for a, b, size in sm.get_matching_blocks():
+        if size < min_block:
+            continue
+        for k in range(size):
+            li = s_owner[b + k]
+            matched[li] += 1
+            w = words[t_owner[a + k]]
+            if w.end > w.start:
+                line_times[li].append((w.start, w.end))
+
+    raw: List[Tuple[Optional[float], Optional[float]]] = []
+    for i in range(n):
+        if line_times[i] and matched[i] / max(1, total[i]) >= min_line_cov:
+            raw.append((min(s for s, _ in line_times[i]),
+                        max(e for _, e in line_times[i])))
+        else:
+            raw.append((None, None))
+    return raw
+
+
+def _interpolate_unanchored(
+    raw: List[Tuple[Optional[float], Optional[float]]],
+    valid_subs: Sequence[str],
+    interval: float = UNALIGNED_INTERVAL,
+) -> List[Tuple[Optional[float], Optional[float]]]:
+    """Give unanchored lines sensible times from their anchored neighbours:
+    proportional (by text length) between two anchors, a backward fan before the
+    first anchor, a forward fan after the last. No anchors at all -> unchanged
+    (the caller's fallback handles that)."""
+    n = len(raw)
+    out = list(raw)
+    anchored = [i for i in range(n) if raw[i][0] is not None]
+    if not anchored:
+        return out
+    lengths = [max(1, len(_norm_match_chars(ln))) for ln in valid_subs]
+
+    for i in range(anchored[0] - 1, -1, -1):      # before the first anchor
+        e = out[i + 1][0]
+        out[i] = (max(0.0, e - interval), e)
+    prev = anchored[0]
+    for a in anchored[1:]:                         # between anchors
+        gap = list(range(prev + 1, a))
+        if gap:
+            t0, t1 = out[prev][1], out[a][0]
+            span = max(0.0, t1 - t0)
+            total_len = sum(lengths[i] for i in gap)
+            t = t0
+            for i in gap:
+                dt = span * lengths[i] / total_len
+                out[i] = (t, t + dt)
+                t += dt
+        prev = a
+    for i in range(anchored[-1] + 1, n):           # after the last anchor
+        s = out[i - 1][1]
+        out[i] = (s, s + interval)
+    return out
+
+
 def _map_words_to_lines(valid_subs: Sequence[str], all_words: List) -> List[List]:
     """Walk the flat word list once, distributing words to lines by char count."""
     mapping: List[List] = []
@@ -598,9 +723,14 @@ class GroqTranscriber:
         """Re-time existing subtitle lines against the audio and write an SRT.
 
         Groq has no forced-alignment mode, so we transcribe the audio with
-        word-level timestamps and distribute those words across the given lines
-        by character count (the same mapping the local aligner used as a
-        fallback). ``fill_gaps`` keeps each line on screen until the next."""
+        word-level timestamps and anchor each line to the words whose text
+        actually matches it (character-level fuzzy matching — survives spelling
+        wobble, digits vs spelled-out numbers, and audio content missing from
+        the SRT such as a spoken intro title). Unanchored lines interpolate
+        between their anchored neighbours. If almost nothing matches (e.g. the
+        SRT is in a different language than the audio), falls back to dealing
+        words out by character count. ``fill_gaps`` keeps each line on screen
+        until the next."""
         if not self.api_key:
             self.log("[!] Error: Groq API Key is missing in settings.")
             return False
@@ -624,14 +754,26 @@ class GroqTranscriber:
                 self.log("-> Groq returned no word timestamps; cannot sync.")
                 return False
             audio_duration = float(_get(resp, "duration", 0.0) or 0.0)
-            raw_times: List[Tuple[Optional[float], Optional[float]]] = []
-            for wl in _map_words_to_lines(valid_subs, words):
-                aligned = [w for w in wl if w.end > w.start]
-                if aligned:
-                    raw_times.append((min(w.start for w in aligned),
-                                      max(w.end for w in aligned)))
-                else:
-                    raw_times.append((None, None))
+            raw_times = _match_lines_to_words(valid_subs, words)
+            anchored = sum(1 for s, _ in raw_times if s is not None)
+            if anchored >= max(1, len(valid_subs) * 0.3):
+                self.log(f"-> Anchored {anchored}/{len(valid_subs)} lines to the "
+                         "transcript; interpolating the rest.")
+                raw_times = _interpolate_unanchored(raw_times, valid_subs,
+                                                    unaligned_interval)
+            else:
+                # Text barely matches the audio (different language / rewrite):
+                # fall back to dealing words out proportionally by char count.
+                self.log(f"-> Only {anchored}/{len(valid_subs)} lines matched the "
+                         "transcript text; falling back to proportional timing.")
+                raw_times = []
+                for wl in _map_words_to_lines(valid_subs, words):
+                    aligned = [w for w in wl if w.end > w.start]
+                    if aligned:
+                        raw_times.append((min(w.start for w in aligned),
+                                          max(w.end for w in aligned)))
+                    else:
+                        raw_times.append((None, None))
             cues = _finalize_cues(raw_times, audio_duration, unaligned_interval,
                                   min_duration, fill_gaps)
             with open(srt_path, "w", encoding="utf-8") as f:
