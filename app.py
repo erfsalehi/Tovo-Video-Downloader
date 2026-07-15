@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime
+import difflib
 import logging
 import os
 import re
@@ -3280,15 +3281,65 @@ class AppleStyleApp:
             width=90, height=34,
         ).pack(side=tk.RIGHT, padx=(0, 8))
 
-    def _get_dub_track(self, title: str) -> Optional[str]:
+    def _find_dub_audio(self, title: str) -> Optional[Path]:
+        """Locate the dub audio for a title: exact filename first, then the
+        closest fuzzy filename match. Dub files are named from the *spoken*
+        title (Voiceover tab transcription), which often drifts from the video
+        title — e.g. 'Pepsi adds.wav' for 'Pepsi ad campaign'."""
         if not self.dub_dir:
             return None
         dub_dir = Path(self.dub_dir)
-        for ext in (".mp3", ".wav", ".m4a"):
+        if not dub_dir.exists():
+            return None
+        for ext in DUB_AUDIO_EXTENSIONS:
             candidate = dub_dir / f"{title}{ext}"
             if candidate.exists():
-                self.log(f"-> Found dub track: {candidate.name} - Syncing with Whisper AI!")
-                return str(candidate)
+                return candidate
+
+        def norm(s: str) -> str:
+            return "".join(ch for ch in s.casefold() if ch.isalnum())
+
+        def digits(s: str) -> str:
+            return "".join(ch for ch in s if ch.isdigit())
+
+        target = norm(title)
+        if not target:
+            return None
+        scored: List[Tuple[float, Path]] = []
+        try:
+            entries = list(dub_dir.iterdir())
+        except OSError:
+            return None
+        for f in entries:
+            if not (f.is_file() and f.suffix.lower() in DUB_AUDIO_EXTENSIONS):
+                continue
+            stem = norm(f.stem)
+            if not stem:
+                continue
+            # "Part 1" must never pair with "Part 2".
+            if digits(target) and digits(stem) and digits(target) != digits(stem):
+                continue
+            # Similarity = contiguous matching runs of >=3 chars; scattered
+            # 1-2 char coincidences don't count. Must cover most of the
+            # shorter name and a fair share of the longer one.
+            sm = difflib.SequenceMatcher(None, target, stem, autojunk=False)
+            m = sum(bl.size for bl in sm.get_matching_blocks() if bl.size >= 3)
+            if m / min(len(target), len(stem)) >= 0.7 and \
+               m / max(len(target), len(stem)) >= 0.45:
+                scored.append((m / min(len(target), len(stem)), f))
+        scored.sort(key=lambda rf: rf[0], reverse=True)
+        if not scored:
+            return None
+        # A near-tie between two different dubs is ambiguous — don't guess.
+        if len(scored) > 1 and scored[0][0] < 0.9 and scored[0][0] - scored[1][0] < 0.1:
+            return None
+        return scored[0][1]
+
+    def _get_dub_track(self, title: str) -> Optional[str]:
+        candidate = self._find_dub_audio(title)
+        if candidate:
+            self.log(f"-> Found dub track: {candidate.name} - Syncing with Whisper AI!")
+            return str(candidate)
         return None
 
     # ------------------------------------------------------------------
@@ -3303,7 +3354,6 @@ class AppleStyleApp:
         self.sync_listbox.delete(0, tk.END)
 
         dl_dir = self.downloads_dir
-        dub_dir = Path(self.dub_dir) if self.dub_dir else None
         srt_files = sorted(dl_dir.glob("*.srt")) if dl_dir.exists() else []
 
         for srt in srt_files:
@@ -3314,12 +3364,11 @@ class AppleStyleApp:
 
             audio_path: Optional[str] = None
             kind = ""
-            if dub_dir and dub_dir.exists():
-                for ext in DUB_AUDIO_EXTENSIONS:
-                    candidate = dub_dir / f"{title}{ext}"
-                    if candidate.exists():
-                        audio_path, kind = str(candidate), "Dub"
-                        break
+            dub = self._find_dub_audio(title)
+            if dub:
+                audio_path, kind = str(dub), "Dub"
+                if dub.stem.casefold() != title.casefold():
+                    kind = f"Dub: {dub.stem}"  # fuzzy match — show what it picked
             if not audio_path:
                 video = dl_dir / f"{title}.mp4"
                 if video.exists():

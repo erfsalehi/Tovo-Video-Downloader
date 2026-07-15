@@ -421,7 +421,7 @@ def _match_lines_to_words(
     valid_subs: Sequence[str],
     words: List,
     min_block: int = 3,
-    min_line_cov: float = 0.15,
+    min_line_cov: float = 0.35,
 ) -> List[Tuple[Optional[float], Optional[float]]]:
     """Anchor each subtitle line to the transcript words that actually match it.
 
@@ -755,17 +755,27 @@ class GroqTranscriber:
                 return False
             audio_duration = float(_get(resp, "duration", 0.0) or 0.0)
             raw_times = _match_lines_to_words(valid_subs, words)
-            anchored = sum(1 for s, _ in raw_times if s is not None)
-            if anchored >= max(1, len(valid_subs) * 0.3):
+            anchored_idx = [i for i, (s, _) in enumerate(raw_times) if s is not None]
+            anchored = len(anchored_idx)
+            well_matched = anchored >= max(1, len(valid_subs) * 0.3)
+            if well_matched:
                 self.log(f"-> Anchored {anchored}/{len(valid_subs)} lines to the "
                          "transcript; interpolating the rest.")
+                trailing = len(valid_subs) - 1 - anchored_idx[-1]
+                if trailing >= 3:
+                    self.log(f"[!] Warning: the last {trailing} lines never matched "
+                             f"the audio ({audio_duration:.0f}s) — the dub may be "
+                             "cut off early. Their timings are estimates.")
                 raw_times = _interpolate_unanchored(raw_times, valid_subs,
                                                     unaligned_interval)
             else:
-                # Text barely matches the audio (different language / rewrite):
-                # fall back to dealing words out proportionally by char count.
-                self.log(f"-> Only {anchored}/{len(valid_subs)} lines matched the "
-                         "transcript text; falling back to proportional timing.")
+                # Text barely matches the audio (different language, wrong or
+                # incomplete dub file, rewritten script): fall back to dealing
+                # words out proportionally by char count.
+                self.log(f"[!] Warning: only {anchored}/{len(valid_subs)} lines "
+                         "matched the audio — it doesn't appear to contain the "
+                         "subtitle text (wrong or incomplete dub?). Timings will "
+                         "be rough estimates.")
                 raw_times = []
                 for wl in _map_words_to_lines(valid_subs, words):
                     aligned = [w for w in wl if w.end > w.start]
@@ -779,7 +789,11 @@ class GroqTranscriber:
             with open(srt_path, "w", encoding="utf-8") as f:
                 for i, ((s, e), line) in enumerate(zip(cues, valid_subs), 1):
                     f.write(f"{i}\n{format_time(s)} --> {format_time(e)}\n{line}\n\n")
-            self.log("-> Groq sync successful! SRT saved.")
+            if well_matched:
+                self.log("-> Groq sync successful! SRT saved.")
+            else:
+                self.log("[!] SRT saved, but with estimated timings — verify the "
+                         "audio source is the correct dub for this subtitle.")
             return True
         except Exception as e:
             self.log(f"[!] Groq alignment failed: {e}")
